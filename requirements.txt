@@ -1,0 +1,17 @@
+fastapi>=0.114.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8.2
+pydantic-settings>=2.3.4
+python-dotenv>=1.0.1
+prometheus-client>=0.20.0
+pyyaml>=6.0.2
+httpx>=0.27.0
+alembic>=1.13.2
+SQLAlchemy>=2.0.31
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+starlette>=0.38.2
+opentelemetry-api>=1.26.0
+opentelemetry-sdk>=1.26.0
+opentelemetry-instrumentation-fastapi>=0.47b0
+opentelemetry-instrumentation-asgi>=0.47b0

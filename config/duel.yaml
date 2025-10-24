@@ -1,0 +1,6 @@
+# Winner rule config
+rule_version: "v1"
+success_weight: 1.0         # reward for success
+latency_penalty_ms: 0.002
+human_score_weight: 0.05    # bonus per human score point (0..5); not used yet in duel
+test_pass_weight: 0.5

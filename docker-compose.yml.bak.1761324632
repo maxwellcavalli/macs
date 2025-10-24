@@ -1,0 +1,107 @@
+version: "3.9"
+
+services:
+  api:
+    env_file:
+      - ./api.env
+    container_name: macs-api
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --proxy-headers
+    env_file: .env
+    environment:
+      RL_RPS: "3"
+      RL_BURST: "6"
+      CANDIDATE_TIMEOUT_SEC: "60"
+      DUEL_TIMEOUT_SEC: "120"
+      LOG_LEVEL: "INFO"
+      BANDIT_EPSILON: "0.1"
+      DATABASE_URL: postgresql+asyncpg://agent:agent@db:5432/agent
+      OLLAMA_HOST: http://ollama:11434
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel:4318
+      GPU_VRAM_GB: "8"
+      OLLAMA_AUTOPULL: "true"
+      OLLAMA_DISCOVERY_REFRESH_SEC: "10"
+    volumes:
+      - ./:/app
+      - ./workspace:/workspace
+      - ./config:/config:ro
+    working_dir: /app
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      otel:
+        condition: service_started
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  db:
+    container_name: macs-db
+    image: postgres:16
+    environment:
+      RL_RPS: "3"
+      RL_BURST: "6"
+      CANDIDATE_TIMEOUT_SEC: "60"
+      DUEL_TIMEOUT_SEC: "120"
+      LOG_LEVEL: "INFO"
+      BANDIT_EPSILON: "0.1"
+      POSTGRES_DB: agent
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  otel:
+    container_name: macs-otel
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./ops/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    restart: unless-stopped
+
+  prometheus:
+    container_name: macs-prometheus
+    image: prom/prometheus:latest
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  ollama:
+    container_name: ollama
+    image: ollama/ollama:latest
+    gpus: all
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      start_period: 90s
+      retries: 60
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama:

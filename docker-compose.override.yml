@@ -1,0 +1,5 @@
+services:
+  api:
+    environment:
+      RL_RPS: "3"
+      RL_BURST: "6"

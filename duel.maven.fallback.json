@@ -1,0 +1,12 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": [],
+    "repo": { "path": "./workspace", "include": [], "exclude": [] },
+    "constraints": { "max_tokens": 2048, "latency_ms": 120000 },
+    "goal": "Create a single-file Java class that compiles with plain JDK."
+  },
+  "routing_hints": { "duel": true },
+  "output_contract": { "expected_files": ["src/main/java/com/acme/Demo.java"] }
+}

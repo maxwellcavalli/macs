@@ -1,0 +1,12 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": [],
+    "repo": { "path": "./workspace", "include": [], "exclude": [] },
+    "constraints": { "max_tokens": 2048, "latency_ms": 60000 },
+    "goal": "Generate a tiny REST handler."
+  },
+  "routing_hints": { "duel": true },
+  "output_contract": { "expected_files": ["src/main/java/com/acme/Demo2.java"] }
+}

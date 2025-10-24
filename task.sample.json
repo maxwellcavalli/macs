@@ -1,0 +1,44 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": [
+      "spring-boot",
+      "r2dbc",
+      "graphql"
+    ],
+    "repo": {
+      "path": "./workspace",
+      "include": [
+        "src/**"
+      ],
+      "exclude": [
+        "**/target/**"
+      ]
+    },
+    "constraints": {
+      "max_tokens": 2048,
+      "latency_ms": 60000,
+      "style": "clean-arch"
+    },
+    "goal": "Implement Product GraphQL resolver with tests."
+  },
+  "output_contract": {
+    "expected_files": [
+      "src/main/java/com/acme/product/ProductResolver.java",
+      "src/test/java/com/acme/product/ProductResolverTest.java"
+    ],
+    "package_name": "com.acme.product",
+    "test_targets": [
+      ":test --tests *ProductResolverTest*"
+    ]
+  },
+  "non_negotiables": {
+    "build_tool": "gradle",
+    "jdk": 21
+  },
+  "oracle": {
+    "smoke": true,
+    "full": false
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "task_id": "5b59eee9-56cc-4a2f-a84c-b474f7138948",
+  "model": "qwen2.5-coder:14b-q4",
+  "success": true,
+  "latency_ms": 18200,
+  "human_score": 4,
+  "notes": "Compiles, tests passed."
+}

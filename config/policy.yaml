@@ -1,0 +1,15 @@
+rules:
+  - id: FS_OUTSIDE_WORKSPACE
+    when: "write_path_not_in_workspace"
+    action: deny
+    reason: "Write outside workspace"
+  - id: EXEC_NETWORK_DISABLED
+    when: "exec_network_true"
+    action: deny
+    reason: "Network egress disabled"
+  - id: SECRET_EXFIL
+    when: "output_contains_secret"
+    action: redact
+    reason: "Secret detected"
+logging:
+  audit_log: enabled

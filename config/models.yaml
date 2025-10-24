@@ -1,0 +1,25 @@
+models:
+  - name: llama3.1
+    size: 8b
+    quant: q4
+    ctx_size: 8192
+    min_vram_gb: 6
+    speed_rank: 1
+    langs: [java, python, docs, planner]
+
+  - name: mistral
+    size: 7b
+    quant: q4
+    ctx_size: 8192
+    min_vram_gb: 5
+    speed_rank: 2
+    langs: [java, python, docs]
+
+  # Keep a bigger model available but de-prioritized (will be slow on 8 GiB)
+  - name: qwen2.5-coder
+    size: 14b
+    quant: q4
+    ctx_size: 8192
+    min_vram_gb: 12
+    speed_rank: 9
+    langs: [java, python, docs]
