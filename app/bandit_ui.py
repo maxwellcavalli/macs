@@ -104,6 +104,7 @@ async def bandit_dashboard():
     }
   }
   async function load(){
+    // prefer unified stats endpoint with fallback
     try{ const r=await fetch('/v1/bandit/stats'); renderStats(await r.json()); }catch(e){ $('stats-err').textContent='Stats fetch failed'; }
     try{ const r2=await fetch('/v1/bandit/observations?limit=100'); if(r2.ok){ renderObs(await r2.json()); } }catch(e){}
   } load();
