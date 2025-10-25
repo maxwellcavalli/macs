@@ -1,14 +1,10 @@
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from typing import List, Dict, Any
-from pathlib import Path
-import json
 
 router = APIRouter()
 
 @router.api_route("/bandit", methods=["GET","HEAD"], response_class=HTMLResponse)
 async def bandit_dashboard():
-    # Tailwind CDN for a clean layout
     html = """<!doctype html>
 <html lang="en">
 <head>
@@ -20,15 +16,36 @@ async def bandit_dashboard():
   <div class="max-w-6xl mx-auto p-6">
     <div class="flex items-center gap-3 mb-6">
       <h1 class="text-2xl font-semibold">Bandit Dashboard</h1>
-      <span id="backend" class="text-xs px-2 py-1 rounded-full bg-slate-800 text-slate-300">loading…</span>
+      <span id="backend" class="text-xs px-2 py-1 rounded-full bg-slate-800 text-slate-300">loading...</span>
     </div>
+
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <!-- Stats -->
       <section class="rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
         <div class="p-5 border-b border-slate-800">
-          <h2 class="text-lg text-slate-200">Stats</h2>
-          <p id="stats-err" class="text-sm text-slate-400 mt-1"></p>
+          <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
+            <div>
+              <h2 class="text-lg text-slate-200">Stats</h2>
+              <p id="stats-err" class="text-sm text-slate-400 mt-1"></p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <input id="filter" type="text" placeholder="Filter models..." class="px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-sm focus:outline-none focus:ring focus:ring-slate-600">
+              <select id="sortBy" class="px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-sm">
+                <option value="last_ts">Sort: last_ts</option>
+                <option value="count">Sort: count</option>
+                <option value="sum_reward">Sort: sum</option>
+                <option value="avg_reward">Sort: avg</option>
+              </select>
+              <select id="sortDir" class="px-3 py-2 rounded-xl bg-slate-800/60 border border-slate-700 text-sm">
+                <option value="desc">desc</option>
+                <option value="asc">asc</option>
+              </select>
+              <button id="downloadCsv" class="px-3 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-sm">Download CSV</button>
+            </div>
+          </div>
         </div>
         <div class="p-5 overflow-x-auto">
+          <div class="text-xs text-slate-400 mb-2"><span id="rowsCount">0</span> rows</div>
           <table class="min-w-full text-sm">
             <thead class="text-slate-400 border-b border-slate-800">
               <tr>
@@ -40,78 +57,175 @@ async def bandit_dashboard():
               </tr>
             </thead>
             <tbody id="stats-tbody" class="divide-y divide-slate-800">
-              <tr><td colspan="5" class="py-4 text-slate-400">Loading…</td></tr>
+              <tr><td colspan="5" class="py-4 text-slate-400">Loading...</td></tr>
             </tbody>
           </table>
         </div>
       </section>
+
+      <!-- Observations -->
       <section class="rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
         <div class="p-5 border-b border-slate-800">
           <h2 class="text-lg text-slate-200">Recent observations</h2>
           <p id="obs-err" class="text-sm text-slate-400 mt-1"></p>
         </div>
-        <div id="obs-list" class="p-5 text-sm text-slate-300 font-mono grid gap-1">Loading…</div>
+        <div id="obs-list" class="p-5 text-sm text-slate-300 font-mono grid gap-1">Loading...</div>
       </section>
     </div>
+
     <section class="rounded-2xl border border-slate-800 bg-slate-900/60 shadow mt-6">
       <div class="p-5">
         <h2 class="text-lg text-slate-200">API quick links</h2>
         <div class="mt-2 text-sky-300">
           <a class="hover:underline mr-3" href="/v1/bandit/stats" target="_blank">/v1/bandit/stats</a>
+          <a class="hover:underline mr-3" href="/v1/bandit/stats_unified" target="_blank">/v1/bandit/stats_unified</a>
           <a class="hover:underline" href="/v1/bandit/observations?limit=50" target="_blank">/v1/bandit/observations?limit=50</a>
         </div>
       </div>
     </section>
   </div>
+
   <script>
-  const $=(id)=>document.getElementById(id);
-  function renderStats(data){
-    try{
-      if(!data||!data.stats) throw new Error('no stats');
-      if(data.backend) $('backend').textContent=data.backend;
-      const s=data.stats, rows=[];
-      if(Array.isArray(s)){
-        for(const r of s){
-          const m=r.model_id||r.model||'(unknown)';
-          rows.push([m,r.n??r.count??'',r.sum_reward??r.sum??'',r.avg_reward??r.avg??'',r.last_ts??'']);
-        }
-      }else{
-        for(const m of Object.keys(s).sort()){
-          const r=s[m]||{}; rows.push([m,r.count??'',r.sum??'',r.avg??'',r.last_ts??'']);
-        }
+  var $ = function(id){ return document.getElementById(id); };
+  var _allRows = [];
+  var _displayRows = [];
+
+  function valueOr(a,b){ return (a !== null && a !== undefined) ? a : b; }
+
+  function normalizeStats(data){
+    if(!data || !data.stats) return [];
+    var arr = [];
+    var s = data.stats;
+    if(Array.isArray(s)){
+      for(var i=0;i<s.length;i++){
+        var r = s[i] || {};
+        var model = r.model_id || r.model || '(unknown)';
+        var count = Number(valueOr(valueOr(r.n, r.count), 0));
+        var sumR  = Number(valueOr(valueOr(r.sum_reward, r.sum), 0));
+        var avgR  = Number(valueOr(valueOr(r.avg_reward, r.avg), 0));
+        var ts    = Number(valueOr(r.last_ts, 0));
+        arr.push({ model_id: model, count: count, sum_reward: sumR, avg_reward: avgR, last_ts: ts });
       }
-      $('stats-tbody').innerHTML = rows.map(r=>(
-        '<tr class="hover:bg-slate-800/40 transition">'
-        +'<td class="py-2 pr-4 font-mono text-slate-200">'+r[0]+'</td>'
-        +'<td class="py-2 px-2 text-right font-mono">'+r[1]+'</td>'
-        +'<td class="py-2 px-2 text-right font-mono">'+r[2]+'</td>'
-        +'<td class="py-2 px-2 text-right font-mono">'+r[3]+'</td>'
-        +'<td class="py-2 pl-2 text-right font-mono">'+r[4]+'</td></tr>'
-      )).join('') || '<tr><td colspan="5" class="py-4 text-slate-400">No data</td></tr>';
-    }catch(e){ $('stats-err').textContent='Stats error: '+e.message; }
+    } else {
+      var keys = Object.keys(s);
+      for(var j=0;j<keys.length;j++){
+        var m = keys[j];
+        var v = s[m] || {};
+        var count2 = Number(valueOr(v.count, 0));
+        var sumR2  = Number(valueOr(v.sum, 0));
+        var avgR2  = Number(valueOr(v.avg, 0));
+        var ts2    = Number(valueOr(v.last_ts, 0));
+        arr.push({ model_id: m, count: count2, sum_reward: sumR2, avg_reward: avgR2, last_ts: ts2 });
+      }
+    }
+    return arr;
   }
+
+  function renderTable(rows){
+    $('rowsCount').textContent = rows.length;
+    if(!rows.length){
+      $('stats-tbody').innerHTML = '<tr><td colspan="5" class="py-4 text-slate-400">No data</td></tr>';
+      return;
+    }
+    $('stats-tbody').innerHTML = rows.map(function(r){
+      return '<tr class="hover:bg-slate-800/40 transition">'
+        + '<td class="py-2 pr-4 font-mono text-slate-200">'+r.model_id+'</td>'
+        + '<td class="py-2 px-2 text-right font-mono">'+r.count+'</td>'
+        + '<td class="py-2 px-2 text-right font-mono">'+(Math.round(r.sum_reward*1000)/1000)+'</td>'
+        + '<td class="py-2 px-2 text-right font-mono">'+(Math.round(r.avg_reward*1000)/1000)+'</td>'
+        + '<td class="py-2 pl-2 text-right font-mono">'+r.last_ts+'</td>'
+        + '</tr>';
+    }).join('');
+  }
+
+  function applyFilterSort(){
+    var q = ( $('filter').value || '' ).toLowerCase().trim();
+    var sortBy = $('sortBy').value;
+    var dir = $('sortDir').value;
+    var rows = _allRows.filter(function(r){ return (r.model_id || '').toLowerCase().indexOf(q) !== -1; });
+    var mult = (dir === 'asc') ? 1 : -1;
+    rows.sort(function(a,b){
+      if (a[sortBy] === b[sortBy]) return 0;
+      return (a[sortBy] < b[sortBy] ? -1 : 1) * mult;
+    });
+    _displayRows = rows;
+    renderTable(rows);
+  }
+
+  function downloadCSV(){
+    var rows = _displayRows.length ? _displayRows : _allRows;
+    var header = ['model_id','count','sum_reward','avg_reward','last_ts'];
+    var escapeCsv = function(v){ return String(v).replace(/"/g,'""'); };
+    var lines = [header.join(',')];
+    for (var i=0;i<rows.length;i++){
+      var r = rows[i] || {};
+      var vals = [r.model_id, r.count, r.sum_reward, r.avg_reward, r.last_ts];
+      for (var j=0;j<vals.length;j++){
+        var val = (vals[j]===null||vals[j]===undefined)?'':vals[j];
+        vals[j] = '"' + escapeCsv(val) + '"';
+      }
+      lines.push(vals.join(','));
+    }
+    var csv = lines.join('\\n');
+    var blob = new Blob([csv], {type:'text/csv'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = 'bandit_stats.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function attachEvents(){
+    var t = null;
+    $('filter').addEventListener('input', function(){ if(t) clearTimeout(t); t = setTimeout(applyFilterSort, 120); });
+    $('sortBy').addEventListener('change', applyFilterSort);
+    $('sortDir').addEventListener('change', applyFilterSort);
+    $('downloadCsv').addEventListener('click', downloadCSV);
+  }
+
+  function renderStats(data){
+    try { if(data && data.backend) $('backend').textContent = data.backend; } catch(e){}
+    _allRows = normalizeStats(data);
+    applyFilterSort();
+  }
+
   function renderObs(data){
     try{
-      if(!data||!Array.isArray(data.events)) throw new Error('no observations');
-      const items=data.events.slice(-20).reverse().map(ev=>{
-        const m=(ev.meta&&ev.meta.model_id)?ev.meta.model_id:ev.model;
+      if(!data || !Array.isArray(data.events)) throw new Error('no observations');
+      var last = data.events.slice(-20).reverse().map(function(ev){
+        var m = (ev.meta && ev.meta.model_id) ? ev.meta.model_id : (ev.model_id || ev.model);
         return '<div>ts='+ev.ts+' · model='+m+' · reward='+ev.reward+'</div>';
       }).join('');
-      $('obs-list').innerHTML=items||'<div class="text-slate-400">No recent events</div>';
+      $('obs-list').innerHTML = last || '<div class="text-slate-400">No recent events</div>';
     }catch(e){
-      $('obs-err').textContent='Observations unavailable (file backend only in MVP).';
-      $('obs-list').innerHTML='<div class="text-slate-400">—</div>';
+      $('obs-err').textContent = 'Observations unavailable.';
+      $('obs-list').innerHTML = '<div class="text-slate-400">-</div>';
     }
   }
-  async function load(){
-    // prefer unified stats endpoint with fallback
-    try{ const r=await fetch('/v1/bandit/stats'); renderStats(await r.json()); }catch(e){ $('stats-err').textContent='Stats fetch failed'; }
-    try{ const r2=await fetch('/v1/bandit/observations?limit=100'); if(r2.ok){ renderObs(await r2.json()); } }catch(e){}
-  } load();
+
+  function load(){
+    attachEvents();
+    fetch('/v1/bandit/stats_unified').then(function(r){
+      return r.ok ? r.json() : fetch('/v1/bandit/stats').then(function(r2){ return r2.json(); });
+    }).then(renderStats).catch(function(){ $('stats-err').textContent='Stats fetch failed'; });
+
+    fetch('/v1/bandit/observations?limit=100').then(function(r){
+      if(r.ok) return r.json();
+    }).then(function(j){ if(j) renderObs(j); }).catch(function(){});
+  }
+  load();
   </script>
-</body></html>"""
+</body>
+</html>"""
     return HTMLResponse(content=html, status_code=200)
 
+# Aliases to /v1/bandit and /v1/bandit/
+@router.api_route("/v1/bandit", methods=["GET","HEAD"], response_class=HTMLResponse)
+@router.api_route("/v1/bandit/", methods=["GET","HEAD"], response_class=HTMLResponse)
+async def bandit_dashboard_v1():
+    return await bandit_dashboard()
+
+# Observations (PG auto-switch via bandit_service, fallback to file)
 @router.api_route("/v1/bandit/observations", methods=["GET","HEAD"])
 async def bandit_observations(limit: int = Query(100, ge=1, le=500)):
     try:
@@ -119,9 +233,4 @@ async def bandit_observations(limit: int = Query(100, ge=1, le=500)):
         backend, events = get_observations(limit)
         return {"ok": True, "backend": backend, "count": len(events), "events": events}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"observations error: {e}")
-@router.api_route("/v1/bandit", methods=["GET","HEAD"], response_class=HTMLResponse)
-@router.api_route("/v1/bandit/", methods=["GET","HEAD"], response_class=HTMLResponse)
-async def bandit_dashboard_v1():
-    # Alias to /bandit for convenience
-    return await bandit_dashboard()
+        raise HTTPException(status_code=500, detail="observations error: {}".format(e))
