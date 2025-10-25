@@ -1,0 +1,1 @@
+{"ok": true, "task_id": "1434a015-f9e2-482e-9b0f-baeac4d5f2b5", "prompt": "Implement a function that returns the sum of two integers.", "models": ["qwen2.5-coder", "llama3.1-70b"]}

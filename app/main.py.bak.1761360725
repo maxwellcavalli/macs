@@ -279,10 +279,3 @@ if _app is not None:
     def _tasks_stream(task_id: str):
         return StreamingResponse(_stream_gen(task_id), media_type="text/event-stream")
     _app.add_api_route("/v1/tasks/{task_id}/stream", _tasks_stream, methods=["GET"])
-
-# --- Attach SSE+status router (idempotent) ---
-try:
-    from .sse_routes import router as _sse_router  # type: ignore
-    app.include_router(_sse_router)
-except Exception:
-    pass

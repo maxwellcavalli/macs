@@ -17,8 +17,6 @@ from .exec_sandbox import run_sandboxed
 from .build_java import build_and_test_java
 from .logging_setup import get_logger
 from .logctx import set_task_id, set_candidate
-
-# additions
 from .bandit_store import record_event as bandit_record_event
 from .artifacts import write_result
 
@@ -107,6 +105,13 @@ class JobQueue:
         # Track inflight tasks for cancel
         self._inflight: Dict[str, List[asyncio.Task]] = {}
 
+
+    def _write_artifact_safely(self, task_id: str, payload: Dict[str, Any]) -> None:
+        try:
+            write_result(str(task_id), payload)
+        except Exception:
+            pass
+
     async def start(self):
         if self._task is None:
             self._task = asyncio.create_task(self._runner())
@@ -128,12 +133,6 @@ class JobQueue:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(generated if generated.strip() else "// (empty)\n", encoding="utf-8")
         return target
-
-    def _write_artifact_safely(self, task_id: str, payload: Dict[str, Any]) -> None:
-        try:
-            write_result(str(task_id), payload)
-        except Exception:
-            pass
 
     async def _run_candidate_inner(self, job: dict, candidate: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         """Inner function that we can time-limit with wait_for."""
@@ -261,26 +260,38 @@ class JobQueue:
                     self._inflight[str(id)].append(t)
                     res = await t
                     reward = 1.0 if res.get("test_pass") else (0.5 if res.get("compile_pass") else 0.0)
-
-                    # bandit: log real single-run reward
+                    # --- bandit persistence (auto-injected) ---
                     try:
-                        bandit_record_event(res.get("model") or "unknown", float(reward), {"src":"queue","task_id": str(id),"mode":"single"})
+                        from .bandit_store import record_event as _bandit_record_event
+                        _m = (
+                            locals().get('model') or locals().get('model_name') or
+                            getattr(locals().get('candidate', None), 'model', None) or
+                            locals().get('cand_model') or locals().get('name') or 'unknown'
+                        )
+                        _bandit_record_event(str(_m), float(locals().get('reward')), {'src':'queue'})
                     except Exception:
                         pass
 
                     async with eng.begin() as conn:
                         await update_task_status(conn, id, "done", model_used=res.get("model"), latency_ms=res.get("latency_ms"))
                         await upsert_stat(conn, res["model"], fh, reward)
-
-                    # artifact for SSE completion
-                    self._write_artifact_safely(str(id), {
-                        "status":"done","mode":"single",
-                        "model":res.get("model"), "latency_ms":res.get("latency_ms"),
-                        "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
-                        "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs")
-                    })
-
-                    await self.hub.publish(str(id), json.dumps({
+                    except Exception:
+                        pass
+                    except Exception:
+                        pass
+self._write_artifact_safely(str(id), {
+    "status":"done","mode":"single",
+    "model":res.get("model"), "latency_ms":res.get("latency_ms"),
+    "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
+    "tool":res.get("tool"), "artifact":res.get("artifact")
+})
+self._write_artifact_safely(str(id), {
+    "status":"done","mode":"single",
+    "model":res.get("model"), "latency_ms":res.get("latency_ms"),
+    "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
+    "tool":res.get("tool"), "artifact":res.get("artifact")
+})
+await self.hub.publish(str(id), json.dumps({
                         "status":"done",
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
@@ -303,15 +314,6 @@ class JobQueue:
                         async with eng.begin() as conn:
                             await update_task_status(conn, id, "done", model_used=res.get("model"), latency_ms=res.get("latency_ms"))
                             await upsert_stat(conn, res["model"], fh, reward)
-
-                        # artifact
-                        self._write_artifact_safely(str(id), {
-                            "status":"done","mode":"single",
-                            "model":res.get("model"), "latency_ms":res.get("latency_ms"),
-                            "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
-                            "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs")
-                        })
-
                         await self.hub.publish(str(id), json.dumps({"status":"done","model":res.get("model"),"latency_ms":res.get("latency_ms"),
                             "compile_pass":res.get("compile_pass"),"test_pass":res.get("test_pass"),"tool":res.get("tool"),"artifact":res.get("artifact"),"logs":res.get("logs")}))
                         self.queue.task_done(); self._inflight.pop(str(id), None); continue
@@ -367,14 +369,14 @@ class JobQueue:
                     duel_rule_decisions_total.labels(rule_version=str(cfg.get("rule_version","v1"))).inc()
 
                     reward_w = 1.0 if winner.get("test_pass") else (0.5 if winner.get("compile_pass") else 0.0)
-                    reward_l = 1.0 if loser.get("test_pass") else (0.5 if loser.get("compile_pass") else 0.0)
-
-                    # bandit: log duel rewards (winner & loser)
+                    # bandit: log duel rewards
                     try:
                         bandit_record_event(winner.get("model") or "unknown", float(reward_w), {"src":"queue","task_id": str(id),"mode":"duel","role":"winner","opponent": (loser.get("model") or "unknown")})
                         bandit_record_event(loser.get("model") or "unknown", float(reward_l), {"src":"queue","task_id": str(id),"mode":"duel","role":"loser","opponent": (winner.get("model") or "unknown")})
                     except Exception:
                         pass
+
+                    reward_l = 1.0 if loser.get("test_pass") else (0.5 if loser.get("compile_pass") else 0.0)
 
                     async with eng.begin() as conn:
                         await update_task_status(conn, id, "done", model_used=winner["model"], latency_ms=min(a_res["latency_ms"], b_res["latency_ms"]))
@@ -387,18 +389,24 @@ class JobQueue:
                         await upsert_stat(conn, winner["model"], fh, reward_w)
                         await upsert_stat(conn, loser["model"], fh, reward_l)
 
-                    # artifact for duel completion
-                    self._write_artifact_safely(str(id), {
-                        "status":"done","mode":"duel",
-                        "winner": winner["model"], "loser": loser["model"],
-                        "rule_version": str(cfg.get("rule_version","v1")),
-                        "winner_metrics":{"success":winner["success"], "latency_ms":winner["latency_ms"],
-                                          "compile_pass":winner["compile_pass"], "test_pass":winner["test_pass"], "tool":winner["tool"]},
-                        "loser_metrics":{"success":loser["success"], "latency_ms":loser["latency_ms"],
-                                         "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]}
-                    })
-
-                    await self.hub.publish(str(id), json.dumps({
+                    except Exception:
+                        pass
+                    except Exception:
+                        pass
+self._write_artifact_safely(str(id), {
+    "status":"done","mode":"duel",
+    "winner": winner.get("model"), "loser": loser.get("model"),
+    "rule_version": str(cfg.get("rule_version","v1")),
+    "winner_metrics": {"success":winner.get("success"), "latency_ms":winner.get("latency_ms"), "compile_pass":winner.get("compile_pass"), "test_pass":winner.get("test_pass"), "tool":winner.get("tool")},
+    "loser_metrics": {"success":loser.get("success"), "latency_ms":loser.get("latency_ms"), "compile_pass":loser.get("compile_pass"), "test_pass":loser.get("test_pass"), "tool":loser.get("tool")}
+})
+self._write_artifact_safely(str(id), {
+    "status":"done","mode":"duel",
+    "winner": winner.get("model"), "loser": loser.get("model"),
+    "rule_version": str(cfg.get("rule_version","v1")),
+    "winner_metrics": {"success":winner.get("success"), "latency_ms":winner.get("latency_ms"), "compile_pass":winner.get("compile_pass"), "test_pass":winner.get("test_pass"), "tool":winner.get("tool")},
+    "loser_metrics": {"success":loser.get("success"), "latency_ms":loser.get("latency_ms"), "compile_pass":loser.get("compile_pass"), "test_pass":loser.get("test_pass"), "tool":loser.get("tool")}})
+await self.hub.publish(str(id), json.dumps({
                         "status":"done",
                         "winner": winner["model"], "loser": loser["model"],
                         "rule_version": str(cfg.get("rule_version","v1")),
@@ -421,3 +429,142 @@ class JobQueue:
             finally:
                 self._inflight.pop(str(id), None)
                 self.queue.task_done()
+
+
+# === BANDIT_AUTOWRAP (do not edit) ===
+try:
+    from .bandit_hook import log_reward as _bandit_log  # type: ignore
+    import functools, inspect
+
+    def _bandit_wrap(fn):
+        if getattr(fn, "_bandit_wrapped", False):
+            return fn
+        @functools.wraps(fn)
+        def _inner(*args, **kwargs):
+            out = fn(*args, **kwargs)
+            try:
+                model = None
+                reward = None
+                # If function returns a mapping/dict with fields
+                if isinstance(out, dict):
+                    reward = out.get("reward", out.get("score"))
+                    model = out.get("model") or out.get("name")
+                # Fall back to kwargs/locals seen by caller if they pass them through
+                if reward is None:
+                    # best effort: look into kwargs
+                    for k in ("reward","score","final_score","total_reward"):
+                        if k in kwargs:
+                            reward = kwargs[k]
+                            break
+                if model is None:
+                    for k in ("model","model_name","name","candidate"):
+                        if k in kwargs:
+                            v = kwargs[k]
+                            model = getattr(v, "model", None) if not isinstance(v, (str,type(None))) else v
+                            break
+                if reward is not None:
+                    _bandit_log(model or "unknown", reward, {"src":"queue.wrap","fn":fn.__name__})
+                return out
+            except Exception:
+                return out
+        _inner._bandit_wrapped = True
+        return _inner
+
+    # Try to wrap likely scoring functions if they exist
+    glb = globals()
+    for _nm in ("compute_reward","_compute_reward","score_candidate","_score_candidate","finalize_score","_finalize_score"):
+        if _nm in glb and callable(glb[_nm]):
+            glb[_nm] = _bandit_wrap(glb[_nm])
+except Exception:
+    pass
+
+
+# === BANDIT_AUTOWRAP (extended) ===
+try:
+    from .bandit_hook import log_reward as _bandit_log  # type: ignore
+    import functools
+
+    def _bandit_wrap(fn):
+        if getattr(fn, "_bandit_wrapped", False):
+            return fn
+        @functools.wraps(fn)
+        def _inner(*args, **kwargs):
+            out = fn(*args, **kwargs)
+            try:
+                model = kwargs.get("model") or kwargs.get("model_name") or kwargs.get("name")
+                cand = kwargs.get("candidate")
+                if cand is not None and not isinstance(cand, (str,type(None))):
+                    model = getattr(cand, "model", model)
+
+                # try common output shapes
+                reward = None
+                if isinstance(out, dict):
+                    for k in ("reward","score","final_score","total_reward","tests_score","compile_score"):
+                        if k in out:
+                            reward = out[k]; break
+                    if not model:
+                        for k in ("model","model_name","name"):
+                            if k in out:
+                                model = out[k]; break
+
+                # fallback to kwargs
+                if reward is None:
+                    for k in ("reward","score","final_score","total_reward","tests_score","compile_score"):
+                        if k in kwargs:
+                            reward = kwargs[k]; break
+
+                if reward is not None:
+                    _bandit_log(model or "unknown", reward, {"src":"queue.wrap.ext","fn":fn.__name__})
+                return out
+            except Exception:
+                return out
+        _inner._bandit_wrapped = True
+        return _inner
+
+    glb = globals()
+    for _nm in (
+        "compute_reward","_compute_reward",
+        "score_candidate","_score_candidate",
+        "finalize_score","_finalize_score",
+        "evaluate_candidate","grade_candidate","calc_score",
+    ):
+        if _nm in glb and callable(glb[_nm]):
+            glb[_nm] = _bandit_wrap(glb[_nm])
+except Exception:
+    pass
+
+
+# === ARTIFACT_AUTOWRAP (do not edit) ===
+try:
+    import functools
+    from .artifacts import write_result as _write_artifact  # type: ignore
+
+    def _artifact_wrap(fn):
+        if getattr(fn, "_artifact_wrapped", False):
+            return fn
+        @functools.wraps(fn)
+        def _inner(*args, **kwargs):
+            out = fn(*args, **kwargs)
+            try:
+                # Best-effort task_id detection
+                tid = (
+                    kwargs.get("task_id")
+                    or (getattr(args[0], "task_id", None) if args else None)
+                    or (out.get("task_id") if isinstance(out, dict) else None)
+                    or (out.get("id") if isinstance(out, dict) else None)
+                )
+                if tid:
+                    payload = out if isinstance(out, dict) else {"ok": True}
+                    _write_artifact(str(tid), {"ok": True, "task_id": str(tid), "result": payload})
+            except Exception:
+                pass
+            return out
+        _inner._artifact_wrapped = True
+        return _inner
+
+    glb = globals()
+    for _nm in ("run_task","execute_task","process_task","run_duel","duel_runner","handle_task","_run_task"):
+        if _nm in glb and callable(glb[_nm]):
+            glb[_nm] = _artifact_wrap(glb[_nm])
+except Exception:
+    pass

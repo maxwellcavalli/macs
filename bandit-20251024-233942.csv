@@ -1,0 +1,5 @@
+ts_iso,model,reward,meta_json
+2025-10-25T02:34:47.673993Z,"force-model",0.777,"{""src"": ""force-endpoint""}"
+2025-10-25T02:36:58.337698Z,"force-model",0.777,"{""src"": ""force-endpoint""}"
+2025-10-25T02:37:36.900186Z,"qwen2.5-coder",1.0,"{""src"": ""duel_stub"", ""prompt"": ""Implement a function that returns the sum of two integers.""}"
+2025-10-25T02:37:36.968786Z,"llama3.1-70b",0.5,"{""src"": ""duel_stub"", ""prompt"": ""Implement a function that returns the sum of two integers.""}"

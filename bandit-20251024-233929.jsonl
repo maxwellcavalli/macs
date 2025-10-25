@@ -1,0 +1,4 @@
+{"ts": 1761359687.673993, "model": "force-model", "reward": 0.777, "meta": {"src": "force-endpoint"}}
+{"ts": 1761359818.3376975, "model": "force-model", "reward": 0.777, "meta": {"src": "force-endpoint"}}
+{"ts": 1761359856.900186, "model": "qwen2.5-coder", "reward": 1.0, "meta": {"src": "duel_stub", "prompt": "Implement a function that returns the sum of two integers."}}
+{"ts": 1761359856.968786, "model": "llama3.1-70b", "reward": 0.5, "meta": {"src": "duel_stub", "prompt": "Implement a function that returns the sum of two integers."}}

@@ -252,39 +252,3 @@ try:
 except Exception as _e:  # pragma: no cover
     # Do not crash if optional bandit API fails to load
     pass
-
-# --- Bandit endpoints (inline + lazy imports) ---
-try:
-    from fastapi import APIRouter, HTTPException
-    _bandit_router = APIRouter()
-
-    @_bandit_router.post("/v1/bandit/record")
-    async def bandit_record(payload: dict):
-        try:
-            from .bandit_store import record_event as _bandit_record_event
-        except Exception:
-            raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        model = str(payload.get("model") or "unknown")
-        try:
-            reward = float(payload.get("reward"))
-        except Exception:
-            raise HTTPException(status_code=422, detail="reward must be a number")
-        meta = payload.get("meta") or {}
-        _bandit_record_event(model, reward, meta)
-        return {"ok": True}
-
-    @_bandit_router.get("/v1/bandit/stats")
-    async def bandit_stats():
-        try:
-            from .bandit_store import get_stats as _bandit_get_stats
-        except Exception:
-            raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        return {"ok": True, "stats": _bandit_get_stats()}
-
-    # Attach to the existing FastAPI app if present
-    _app = globals().get("app")
-    if _app is not None:
-        _app.include_router(_bandit_router)
-except Exception:
-    # Never break startup if optional endpoints fail
-    pass

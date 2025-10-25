@@ -1,0 +1,11 @@
+services:
+  api:
+    environment:
+      ARTIFACTS_DIR: "/data/artifacts"
+      SSE_EARLY_EXIT_ENABLED: "1"
+      SSE_EARLY_EXIT_DIAGNOSTIC: "0"   # set "1" to add x-sse-early-exit header
+      SSE_EARLY_EXIT_ACCEPT_ONLY: "1"  # only trigger when client requests SSE
+      SSE_EARLY_EXIT_PATH_HINTS: "stream,events"
+      SSE_EARLY_EXIT_REQUIRE_ID: "1"
+      RL_RPS: "5"
+      RL_BURST: "15"

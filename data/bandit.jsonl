@@ -1,0 +1,14 @@
+{"ts": 1761359687.673993, "model": "force-model", "reward": 0.777, "meta": {"src": "force-endpoint"}}
+{"ts": 1761359818.3376975, "model": "force-model", "reward": 0.777, "meta": {"src": "force-endpoint"}}
+{"ts": 1761359856.900186, "model": "qwen2.5-coder", "reward": 1.0, "meta": {"src": "duel_stub", "prompt": "Implement a function that returns the sum of two integers."}}
+{"ts": 1761359856.968786, "model": "llama3.1-70b", "reward": 0.5, "meta": {"src": "duel_stub", "prompt": "Implement a function that returns the sum of two integers."}}
+{"ts": 1761360480.024516, "model": "unknown", "reward": 0.5, "meta": {"src": "queue"}}
+{"ts": 1761360752.4984345, "model": "unknown", "reward": 0.5, "meta": {"src": "queue"}}
+{"ts": 1761361013.2954128, "model": "unknown", "reward": 0.5, "meta": {"src": "queue"}}
+{"ts": 1761362515.2974184, "model": "llama3.1:8b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "bd88994b-1a63-47c3-b71f-95bc030a9f60", "mode": "single"}}
+{"ts": 1761362523.0375524, "model": "mistral:7b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "298b563e-a48d-4255-802c-bba0308f7394", "mode": "duel", "role": "winner", "opponent": "llama3.1:8b-q4"}}
+{"ts": 1761362523.068695, "model": "llama3.1:8b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "298b563e-a48d-4255-802c-bba0308f7394", "mode": "duel", "role": "loser", "opponent": "mistral:7b-q4"}}
+{"ts": 1761362609.088206, "model": "mistral:7b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "b5a82626-e91a-4647-839f-3eb59bcee05c", "mode": "duel", "role": "winner", "opponent": "llama3.1:8b-q4"}}
+{"ts": 1761362609.3312151, "model": "llama3.1:8b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "b5a82626-e91a-4647-839f-3eb59bcee05c", "mode": "duel", "role": "loser", "opponent": "mistral:7b-q4"}}
+{"ts": 1761362620.813448, "model": "mistral:7b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "904ae45d-2497-4ee1-9a41-19d3ab154367", "mode": "duel", "role": "winner", "opponent": "llama3.1:8b-q4"}}
+{"ts": 1761362620.8195255, "model": "llama3.1:8b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "904ae45d-2497-4ee1-9a41-19d3ab154367", "mode": "duel", "role": "loser", "opponent": "mistral:7b-q4"}}
