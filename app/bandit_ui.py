@@ -115,38 +115,11 @@ async def bandit_dashboard():
 @router.api_route("/v1/bandit/observations", methods=["GET","HEAD"])
 async def bandit_observations(limit: int = Query(100, ge=1, le=500)):
     try:
-        from .bandit_store import get_store_path
-    except Exception:
-        raise HTTPException(status_code=503, detail="bandit_store unavailable")
-    path = Path(get_store_path())
-    if not path.exists():
-        raise HTTPException(status_code=503, detail="bandit file backend not active or store missing")
-    events: List[Dict[str, Any]] = []
-    with path.open("rb") as f:
-        f.seek(0, 2)
-        pos, chunk, buf = f.tell(), 4096, b""
-        while pos > 0 and len(events) < limit:
-            take = chunk if pos >= chunk else pos
-            pos -= take; f.seek(pos); buf = f.read(take) + buf
-            parts = buf.split(b"\n")
-            if pos > 0: buf, parts = parts[0], parts[1:]
-            else: buf = b""
-            for line in reversed(parts):
-                line=line.strip()
-                if not line: continue
-                try: events.append(json.loads(line.decode("utf-8"))); 
-                except Exception: continue
-                if len(events) >= limit: break
-    events.reverse()
-    return {"ok": True, "backend": "file", "count": len(events), "events": events}
-
-# Self-register with the main router if available (import order safe when imported from main.py)
-try:
-    from .api import router as _app_router  # type: ignore
-    _app_router.include_router(router)
-except Exception:
-    pass
-
+        from .bandit_service import get_observations
+        backend, events = get_observations(limit)
+        return {"ok": True, "backend": backend, "count": len(events), "events": events}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"observations error: {e}")
 @router.api_route("/v1/bandit", methods=["GET","HEAD"], response_class=HTMLResponse)
 @router.api_route("/v1/bandit/", methods=["GET","HEAD"], response_class=HTMLResponse)
 async def bandit_dashboard_v1():
