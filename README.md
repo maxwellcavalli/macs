@@ -1,92 +1,126 @@
-# Multi‑Agent Code System — Phase 1 MVP (v24.0)
+# MACS — Local Dev Stack (API + Postgres + Ollama + Prometheus + Grafana)
 
-Local, offline‑first skeleton implementing the Phase‑1 plan: API, queue, SSE heartbeats, cancel/resume, filesystem/exec sandbox scaffolding, Postgres baseline, model registry with VRAM probe, metrics & tracing, and CLI.
+This repo ships a single `docker-compose.yml` that brings up everything you need:
+- **API** (host `8080`, overridable)
+- **Postgres** (host `55432`, overridable)
+- **Ollama** (GPU; internal-only by default)
+- **Prometheus** (host `39090`)
+- **Grafana** (host `33000`)
 
-## Run (no Docker)
+> **Requirements**: Docker + Docker Compose v2. For GPU, enable NVIDIA GPU support (Docker Desktop → Settings → Resources → GPU) or install NVIDIA Container Toolkit on Linux.
 
-1. Create and activate a virtualenv (or use `uv`).
-2. Install deps:
+---
 
-```bash
-pip install -r requirements.txt
-# or
-pip install .
-```
-
-3. Ensure Postgres is running locally and the URL in `.env` is correct (defaults to `postgresql+asyncpg://agent:agent@localhost:5432/agent`).
-4. Initialize schema (automatically on first start). Optionally run Alembic:
+## 1) Quickstart
 
 ```bash
-alembic upgrade head
+# (one time) Create an API key so the API can boot
+printf "API_KEY=dev-%s
+" "$(openssl rand -hex 16)" > .env
+
+# Build and start everything
+docker compose up -d --build
+
+# See status
+docker compose ps
 ```
 
-5. Start the API:
+### Health checks
 
 ```bash
-uvicorn app.main:app --reload --port 8080
+# API health (no auth)
+curl -fsS "http://127.0.0.1:${API_HOST_PORT:-8080}/health"
+
+# Read your API key (for protected endpoints)
+API_KEY=$(grep -E '^API_KEY=' .env | cut -d= -f2)
+
+# Ollama health proxied via API (requires x-api-key)
+curl -fsS -H "x-api-key: $API_KEY" "http://127.0.0.1:${API_HOST_PORT:-8080}/v1/ollama/health"
+
+# Prometheus readiness
+curl -fsS "http://127.0.0.1:${PROM_HOST_PORT:-39090}/-/ready" || true
 ```
 
-## Run (Docker Compose)
+---
+
+## 2) Default URLs
+
+- **API**
+  - Health: `http://127.0.0.1:${API_HOST_PORT:-8080}/health`
+  - Example (proxied): `http://127.0.0.1:${API_HOST_PORT:-8080}/v1/ollama/health`  
+    _Header_: `x-api-key: <API_KEY from .env>`
+
+- **Grafana**: `http://127.0.0.1:${GRAFANA_HOST_PORT:-33000}`  
+  _Login_: `admin / admin` (change with `GF_ADMIN_USER` / `GF_ADMIN_PASSWORD`)
+
+- **Prometheus**: `http://127.0.0.1:${PROM_HOST_PORT:-39090}`
+
+- **Postgres (host DSN)**:  
+  `postgres://macs:macs@127.0.0.1:${PG_HOST_PORT:-55432}/macs`
+
+- **Ollama**: internal-only (`http://ollama:11434` inside Docker network).  
+  If you need host access, add to compose: `ports: ["127.0.0.1:21434:11434"]` and use `http://127.0.0.1:21434/`.
+
+---
+
+## 3) Common tasks
 
 ```bash
-docker compose up --build
+# Rebuild API only (after code changes)
+docker compose build api && docker compose up -d api
+
+# Tail logs
+docker compose logs -f api
+docker compose logs -f postgres
+docker compose logs -f ollama
+docker compose logs -f prometheus
+docker compose logs -f grafana
+
+# Stop (keep data volumes)
+docker compose down
+
+# Full reset (⚠ removes DB, models, artifacts)
+docker compose down -v
 ```
 
-The API will be at http://localhost:8080 . Health at `/health`, Prometheus at `/metrics`.
+---
 
-## API (MVP)
+## 4) Port overrides (when something else is using the default)
 
-- `POST /v1/tasks` (API key required) → `{task_id}`
-- `GET  /v1/tasks/{id}` → task status
-- `POST /v1/tasks/{id}/cancel` (API key) → cancel
-- `GET  /v1/stream/{id}` → Server‑Sent Events (includes heartbeats)
-- `POST /v1/feedback` (API key) → store feedback
-- `GET  /v1/models` → available models filtered by VRAM and language
-
-Auth: set header `X-API-Key: <API_KEY>` (defaults to `dev-local` from `.env`).
-
-## CLI
+All host ports can be changed on the fly:
 
 ```bash
-export API_KEY=dev-local
-agentctl submit task.json
-agentctl status <uuid>
-agentctl cancel <uuid>
-agentctl feedback feedback.json
+API_HOST_PORT=18080 PG_HOST_PORT=56432 PROM_HOST_PORT=49090 GRAFANA_HOST_PORT=43000 docker compose up -d
 ```
 
-## Example task payload (v1.1)
+---
 
-```json
-{
-  "type": "CODE",
-  "input": {
-    "language": "java",
-    "frameworks": ["spring-boot", "r2dbc", "graphql"],
-    "repo": {"path": "./workspace", "include": ["src/**"], "exclude": ["**/target/**"]},
-    "constraints": {"max_tokens": 2048, "latency_ms": 60000, "style": "clean-arch"},
-    "goal": "Generate Product resolver and tests"
-  },
-  "output_contract": {
-    "expected_files": ["src/main/java/com/acme/product/ProductResolver.java"]
-  },
-  "non_negotiables": {"build_tool": "gradle", "jdk": 21},
-  "oracle": {"smoke": true, "full": false}
-}
-```
+## 5) GPU notes
 
-## Notes
+- Compose uses `gpus: all` for **Ollama**.  
+- If you don’t have GPU support, either enable it or remove the `gpus:` and `deploy.resources.reservations.devices` lines in `docker-compose.yml`.
 
-- Filesystem writes are restricted to `WORKSPACE_ROOT` (`./workspace` by default). An attempted write outside is denied and audited.
-- Exec sandbox only allows a small tool allowlist (javac/mvn/gradlew/pytest/etc.) with timeouts; network egress is not allowed by design.
-- VRAM probe uses `nvidia-smi` when present to filter models by `min_vram_gb`.
-- Metrics include `router_route_count`, `compile_pass_total`, `test_smoke_pass_total`.
-- Tracing is configured to console exporter by default; wire OTLP to the collector via env if desired.
+---
 
-## What’s next (Phase‑2/3 hooks are stubbed)
+## 6) Troubleshooting
 
-- Feedback reward computation & contextual bandit.
-- BM25+symbol retrieval & exemplar injection.
-- Planner → Coder → Tester → Reviewer loop and Duel mode.
+- **“API_KEY missing”** — ensure `.env` exists with `API_KEY=...` (Compose auto-loads `.env`).  
+- **Port conflicts** — bump the host port envs above (e.g., `API_HOST_PORT=18080`).  
+- **Postgres doesn’t start** — try another host port (`PG_HOST_PORT=56432`) or stop a local Postgres.  
+- **Grafana login** — defaults to `admin / admin` unless changed via env.
 
-This repo intentionally favors clarity and bootstrap-ability on WSL2.
+---
+
+## 7) Service summary
+
+| Service    | Host Port (default) | Internal | Notes                                        |
+|------------|----------------------|----------|----------------------------------------------|
+| API        | 8080                 | 8080     | Protected routes require `x-api-key`         |
+| Postgres   | 55432                | 5432     | `postgres://macs:macs@127.0.0.1:55432/macs`  |
+| Prometheus | 39090                | 9090     | Scrapes API `/metrics`                       |
+| Grafana    | 33000                | 3000     | Pre-provisioned Prometheus datasource        |
+| Ollama     | _none_               | 11434    | Internal-only by default (GPU)               |
+
+---
+
+Happy shipping! 🚀
