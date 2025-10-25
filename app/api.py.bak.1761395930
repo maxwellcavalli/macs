@@ -238,43 +238,132 @@ async def metrics_endpoint():
     # Local imports so we don't have to edit global import lines
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from starlette.responses import Response as StarletteResponse
-# --- Bandit API ---
+    try:
+        data = generate_latest()
+        return StarletteResponse(content=data, media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- dev helper: increment SSE counter ---
+@router.post("/dev/incr_sse")
+async def dev_incr_sse(reason: str = "status"):
+    from .metrics import sse_terminated_total
+    sse_terminated_total.labels(reason=reason).inc()
+    return {"ok": True, "reason": reason}
+
+# --- Bandit API (appended) ---
 try:
-    from fastapi import APIRouter, HTTPException
+    from .bandit_api import router as _bandit_router  # type: ignore
+    app.include_router(_bandit_router)
+except Exception as _e:  # pragma: no cover
+    # Do not crash if optional bandit API fails to load
+    pass
+
+# --- Bandit endpoints (inline + lazy imports) ---
+try:
+    from fastapi import Request, APIRouter, HTTPException
     _bandit_router = APIRouter()
 
     @_bandit_router.post("/v1/bandit/record")
-    async def bandit_record(payload: dict):
-        try:
-            from .bandit_store import record_event as _bandit_record_event
-        except Exception:
-            raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        # accept both shapes
-        model = str(payload.get("model") or payload.get("model_id") or "unknown")
-        try:
-            reward = float(payload.get("reward"))
-        except Exception:
-            raise HTTPException(status_code=422, detail="reward must be a number")
-        meta = payload.get("meta") or {}
-        # keep model_id in meta when provided (helps downstream normalization)
-        if payload.get("model_id") and not payload.get("model"):
-            meta["model_id"] = str(payload["model_id"])
-        _bandit_record_event(model, reward, meta)
-        return {"ok": True, "resolved_model": model}
-
-    @_bandit_router.get("/v1/bandit/stats")
-    async def bandit_stats():
-        try:
-            from .bandit_store import get_stats as _bandit_get_stats
-        except Exception:
-            raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        return {"ok": True, "backend": "file", "stats": _bandit_get_stats()}
-
-    # Attach to the main router so main.py picks it up
+def bandit_record(payload: dict):
     try:
-        router.include_router(_bandit_router)
+        from .bandit_store import record_event as _bandit_record_event
     except Exception:
-        pass
-except Exception:
-    # Never break startup if optional endpoints fail
-    pass
+        raise HTTPException(status_code=503, detail="bandit_store unavailable")
+    # accept both shapes
+    model = str(payload.get("model") or payload.get("model_id") or "unknown")
+    try:
+        reward = float(payload.get("reward"))
+    except Exception:
+        raise HTTPException(status_code=422, detail="reward must be a number")
+    meta = payload.get("meta") or {}
+    # keep model_id in meta when provided (helps downstream normalization)
+    if payload.get("model_id") and not payload.get("model"):
+        meta = {**meta, "model_id": str(payload["model_id"])}
+    _bandit_record_event(model, reward, meta)
+    return {"ok": True, "resolved_model": model}
+@router.get("/bandit/report")
+@router.get("/v1/bandit/report")
+async def bandit_report(request: Request, days: int = 30):
+    """
+    Return aggregated bandit stats limited to the last `days` days (epoch filter).
+    """
+    store = (_get_bandit_store(request.app) if "_get_bandit_store" in globals() else getattr(request.app.state, "bandit_store", None))
+    if store is None:
+        return JSONResponse({"error":"bandit store not initialized"}, status_code=503)
+
+    import time
+    cutoff = int(time.time()) - days*24*3600
+    # Best-effort: if the store has .stats() only (no param), filter in Python.
+    try:
+        items = store.stats_since(cutoff)  # if you later add it
+    except Exception:
+        items = [it for it in store.stats() if it.get("last_ts", 0) >= cutoff]
+    return {"cutoff": cutoff, "days": days, "items": items}
+
+@router.get("/bandit/dashboard")
+
+@router.get("/v1/bandit/dashboard", response_class=HTMLResponse)
+@router.get("/bandit/dashboard", response_class=HTMLResponse)
+async def bandit_dashboard(request: Request):
+    store = _get_bandit_store(request.app) if "_get_bandit_store" in globals() else getattr(request.app.state, "bandit_store", None)
+    if store is None:
+        return HTMLResponse("<h1>Bandit</h1><p>Store not initialized.</p>", status_code=503)
+
+    qp = request.query_params
+    task_type = qp.get("task_type")
+    feature_hash = qp.get("feature_hash")
+    features_json = qp.get("features")
+    if features_json and not feature_hash:
+        try:
+            feature_hash = _hash_features(json.loads(features_json))
+        except Exception:
+            pass
+
+    rows = store.stats()
+    if task_type:
+        rows = [r for r in rows if (r.get("task_type") or "") == task_type]
+    if feature_hash:
+        rows = [r for r in rows if (r.get("feature_hash") or "") == feature_hash]
+
+    # aggregate
+    agg = {}
+    for r in rows:
+        m = r.get("model_id") or "unknown"
+        n = int(r.get("n") or 0)
+        ssum = float(r.get("sum_reward") or 0.0)
+        ts = int(r.get("last_ts") or 0)
+        a = agg.setdefault(m, {"count":0,"sum":0.0,"last_ts":0})
+        a["count"] += n
+        a["sum"] += ssum
+        if ts > a["last_ts"]:
+            a["last_ts"] = ts
+    for a in agg.values():
+        a["avg"] = round(a["sum"]/a["count"], 6) if a["count"] else 0.0
+        a["sum"] = round(a["sum"], 6)
+
+    items = sorted(agg.items(), key=lambda kv: (-kv[1]["sum"], -kv[1]["count"], kv[0]))
+    head = "<tr><th>model</th><th>count</th><th>sum</th><th>avg</th><th>last_ts</th></tr>"
+    body = "\n".join(
+        f"<tr><td>{html.escape(m)}</td><td>{a['count']}</td><td>{a['sum']}</td><td>{a['avg']}</td><td>{a['last_ts']}</td></tr>"
+        for m,a in items
+    )
+    form = f"""
+    <form method='get' style='margin:10px 0'>
+      <label>task_type: <input name='task_type' value='{html.escape(task_type or "")}'/></label>
+      <label>feature_hash: <input name='feature_hash' value='{html.escape(feature_hash or "")}'/></label>
+      <label>features (JSON): <input name='features' size='40' value='{html.escape(features_json or "")}'/></label>
+      <button type='submit'>Apply</button>
+    </form>"""
+
+    html_doc = f"""
+    <html><head><meta charset='utf-8'><title>Bandit Dashboard</title>
+    <style>body{{font-family:sans-serif;margin:20px}} table{{border-collapse:collapse}} th,td{{border:1px solid #ddd;padding:6px}} th{{background:#f6f6f6}}</style>
+    </head><body>
+      <h1>Bandit Dashboard</h1>
+      <p><a href="/v1/bandit/stats">/v1/bandit/stats</a> · <a href="/v1/bandit/top">/v1/bandit/top</a></p>
+      {form}
+      <table>{head}{body}</table>
+    </body></html>
+    """
+    return HTMLResponse(html_doc, status_code=200)

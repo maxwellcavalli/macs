@@ -1,0 +1,23 @@
+services:
+  api:
+    environment:
+      - BANDIT_POOL_MAX=8
+      - BANDIT_POOL_MIN=1
+      - BANDIT_PG_DSN=postgresql://agent:agent@db:5432/agent
+      API_KEY: ${API_KEY}
+      ARTIFACTS_DIR: /app/artifacts
+      BANDIT_STORE_PATH: /app/data/bandit.jsonl
+      RL_BURST: "15"
+      RL_RPS: "5"
+      SSE_EARLY_EXIT_ENABLED: "1"
+      SSE_EARLY_EXIT_ACCEPT_ONLY: "1"
+      SSE_EARLY_EXIT_DIAGNOSTIC: "0"
+      SSE_EARLY_EXIT_PATH_HINTS: stream,events
+      SSE_EARLY_EXIT_REQUIRE_ID: "1"
+      BANDIT_HOOK_DEBUG: "1"   # <— add this for extra logs
+      BANDIT_PG_DSN: postgresql://agent:agent@db:5432/agent
+      BANDIT_POOL_MIN: 1
+      BANDIT_POOL_MAX: 8
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts

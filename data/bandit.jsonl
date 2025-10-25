@@ -12,3 +12,46 @@
 {"ts": 1761362609.3312151, "model": "llama3.1:8b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "b5a82626-e91a-4647-839f-3eb59bcee05c", "mode": "duel", "role": "loser", "opponent": "mistral:7b-q4"}}
 {"ts": 1761362620.813448, "model": "mistral:7b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "904ae45d-2497-4ee1-9a41-19d3ab154367", "mode": "duel", "role": "winner", "opponent": "llama3.1:8b-q4"}}
 {"ts": 1761362620.8195255, "model": "llama3.1:8b-q4", "reward": 0.5, "meta": {"src": "queue", "task_id": "904ae45d-2497-4ee1-9a41-19d3ab154367", "mode": "duel", "role": "loser", "opponent": "mistral:7b-q4"}}
+{"ts": 1761390869.27364, "model": "unknown", "reward": 0.777, "meta": {}}
+{"ts": 1761390869.2943165, "model": "unknown", "reward": 0.777, "meta": {}}
+{"ts": 1761390869.3437364, "model": "unknown", "reward": 1.0, "meta": {}}
+{"ts": 1761390869.3913794, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.439466, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.455658, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.4710934, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.5169165, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.532476, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.5481973, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.5637379, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.611331, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.6288126, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761390869.6456678, "model": "unknown", "reward": 0.5, "meta": {}}
+{"ts": 1761391036.7655585, "model": "unknown", "reward": 0.8, "meta": {}}
+{"ts": 1761391037.0666406, "model": "unknown", "reward": 0.6, "meta": {}}
+{"ts": 1761391037.1188588, "model": "unknown", "reward": 0.754, "meta": {}}
+{"ts": 1761391075.3788762, "model": "unknown", "reward": 0.8, "meta": {}}
+{"ts": 1761391075.399525, "model": "unknown", "reward": 0.6, "meta": {}}
+{"ts": 1761391075.4137309, "model": "unknown", "reward": 0.754, "meta": {}}
+{"ts": 1761391406.7556636, "model": "unknown", "reward": 0.8, "meta": {}}
+{"ts": 1761391406.7930257, "model": "unknown", "reward": 0.6, "meta": {}}
+{"ts": 1761391406.8162928, "model": "unknown", "reward": 0.754, "meta": {}}
+{"ts": 1761392621.428667, "model": "unknown", "reward": 0.9, "meta": {}}
+{"ts": 1761392625.0325637, "model": "unknown", "reward": 0.8, "meta": {}}
+{"ts": 1761393754.7004058, "model": "unify-legacy-1761393754", "reward": 0.42, "meta": {}}
+{"ts": 1761393754.730434, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761394176.1391582, "model": "unify-legacy-1761394176", "reward": 0.42, "meta": {}}
+{"ts": 1761394176.1574917, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761394201.043795, "model": "unify-legacy-1761394201", "reward": 0.42, "meta": {}}
+{"ts": 1761394201.089636, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761394220.5430722, "model": "unify-legacy-1761394220", "reward": 0.42, "meta": {}}
+{"ts": 1761394220.5842106, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761394397.6061468, "model": "unify-legacy-1761394397", "reward": 0.42, "meta": {}}
+{"ts": 1761394397.647191, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761394538.7302258, "model": "unify-legacy-1761394538", "reward": 0.42, "meta": {}}
+{"ts": 1761394538.77267, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761396183.939759, "model": "unknown", "reward": 0.88, "meta": {}}
+{"ts": 1761396197.1877632, "model": "unify-legacy-1761396197", "reward": 0.42, "meta": {}}
+{"ts": 1761396197.2034507, "model": "unknown", "reward": 0.84, "meta": {}}
+{"ts": 1761397448.0814662, "model": "unify-new-1761397448", "reward": 0.88, "meta": {"model_id": "unify-new-1761397448"}}
+{"ts": 1761397465.3264866, "model": "unify-legacy-1761397465", "reward": 0.42, "meta": {}}
+{"ts": 1761397465.3439186, "model": "unify-new-1761397465", "reward": 0.84, "meta": {"model_id": "unify-new-1761397465"}}

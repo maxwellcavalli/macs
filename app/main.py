@@ -286,3 +286,34 @@ try:
     app.include_router(_sse_router)
 except Exception:
     pass
+
+
+def _resolve_pg_dsn() -> str | None:
+    import os
+    dsn = os.getenv("BANDIT_PG_DSN")
+    if dsn: return dsn
+    host = os.getenv("PGHOST") or os.getenv("POSTGRES_HOST")
+    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER")
+    pwd  = os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD") or ""
+    db   = os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB")
+    port = os.getenv("PGPORT") or os.getenv("POSTGRES_PORT") or "5432"
+    if host and user and db:
+        return f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+    return None
+
+@app.on_event("startup")
+async def _init_bandit_store():
+    import logging
+    from .bandit_store_pg import BanditStorePG
+    dsn = _resolve_pg_dsn()
+    if not dsn:
+        logging.getLogger(__name__).warning("Bandit store disabled: no Postgres DSN found in env")
+        return
+    try:
+        pool_min = int(os.getenv("BANDIT_POOL_MIN", "1"))
+        pool_max = int(os.getenv("BANDIT_POOL_MAX", "8"))
+        app.state.bandit_store = BanditStorePG(dsn, min_size=pool_min, max_size=pool_max)
+        logging.getLogger(__name__).info("Bandit store initialized with Postgres")
+    except Exception as e:
+        logging.getLogger(__name__).exception("Bandit store init failed: %s", e)
+        app.state.bandit_store = None

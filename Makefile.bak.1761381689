@@ -138,29 +138,26 @@ ci-local:      ## Run integration smoke test locally
   bash tests/integration_smoke.sh
 
 .PHONY: ci-local
-# DUPLICATE ci-local (commented out below)
-# ci-local:      ## Run integration smoke test locally
-# > API=$(API_URL) API_KEY=$(API_KEY) bash tests/integration_smoke.sh
-
+ci-local:      ## Run integration smoke test locally
+> API=$(API_URL) API_KEY=$(API_KEY) bash tests/integration_smoke.sh
 
 # ---- Database (Flyway) ----
 db-info:
-> ./scripts/flyway.sh info
+	./scripts/flyway.sh info
 
 db-migrate:
-> ./scripts/flyway.sh migrate
+	./scripts/flyway.sh migrate
 
+# Use once if your DB already has tables and you want to start Flyway at version 0
 db-baseline-0:
-> ./scripts/flyway.sh baseline -baselineVersion=0
+	./scripts/flyway.sh baseline -baselineVersion=0
 
 db-validate:
-> ./scripts/flyway.sh validate
+	./scripts/flyway.sh validate
 
 db-repair:
-> ./scripts/flyway.sh repair
+	./scripts/flyway.sh repair
 
+# DANGER: drops everything in the database
 db-clean:
-> ./scripts/flyway.sh clean
-
-bandit-seed: ## Replay earlier bandit totals into the DB
-> ./scripts/bandit_seed.sh
+	./scripts/flyway.sh clean

@@ -238,43 +238,64 @@ async def metrics_endpoint():
     # Local imports so we don't have to edit global import lines
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from starlette.responses import Response as StarletteResponse
-# --- Bandit API ---
+    try:
+        data = generate_latest()
+        return StarletteResponse(content=data, media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- dev helper: increment SSE counter ---
+@router.post("/dev/incr_sse")
+async def dev_incr_sse(reason: str = "status"):
+    from .metrics import sse_terminated_total
+    sse_terminated_total.labels(reason=reason).inc()
+    return {"ok": True, "reason": reason}
+
+# --- Bandit API (appended) ---
 try:
-    from fastapi import APIRouter, HTTPException
+    from .bandit_api import router as _bandit_router  # type: ignore
+    app.include_router(_bandit_router)
+except Exception as _e:  # pragma: no cover
+    # Do not crash if optional bandit API fails to load
+    pass
+
+# --- Bandit endpoints (inline + lazy imports) ---
+try:
+    from fastapi import Request, APIRouter, HTTPException
     _bandit_router = APIRouter()
 
     @_bandit_router.post("/v1/bandit/record")
+
     async def bandit_record(payload: dict):
+
         try:
+
             from .bandit_store import record_event as _bandit_record_event
+
         except Exception:
+
             raise HTTPException(status_code=503, detail="bandit_store unavailable")
+
         # accept both shapes
+
         model = str(payload.get("model") or payload.get("model_id") or "unknown")
+
         try:
+
             reward = float(payload.get("reward"))
+
         except Exception:
+
             raise HTTPException(status_code=422, detail="reward must be a number")
+
         meta = payload.get("meta") or {}
+
         # keep model_id in meta when provided (helps downstream normalization)
+
         if payload.get("model_id") and not payload.get("model"):
-            meta["model_id"] = str(payload["model_id"])
+
+            meta = {**meta, "model_id": str(payload["model_id"])}
+
         _bandit_record_event(model, reward, meta)
+
         return {"ok": True, "resolved_model": model}
-
-    @_bandit_router.get("/v1/bandit/stats")
-    async def bandit_stats():
-        try:
-            from .bandit_store import get_stats as _bandit_get_stats
-        except Exception:
-            raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        return {"ok": True, "backend": "file", "stats": _bandit_get_stats()}
-
-    # Attach to the main router so main.py picks it up
-    try:
-        router.include_router(_bandit_router)
-    except Exception:
-        pass
-except Exception:
-    # Never break startup if optional endpoints fail
-    pass

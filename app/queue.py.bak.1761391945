@@ -195,7 +195,7 @@ class JobQueue:
 
         latency_ms = int((time.time() - t0) * 1000)
 
-        __RET__ = {
+        return {
             "model": model_str,
             "success": bool(test_pass or compile_pass),
             "latency_ms": latency_ms,
@@ -207,29 +207,13 @@ class JobQueue:
             "logs": {"build_stdout_tail": out_tail, "build_stderr_tail": err_tail},
             "artifact": str(primary_path)
         }
-        # --- Bandit autolog (inserted) ---
-        try:
-            from .bandit_client import record as bandit_record
-            _wm = __RET__.get('winner_model') or __RET__.get('winner') or __RET__.get('model') or __RET__.get('chosen')
-            _ws = (__RET__.get('winner_score') or __RET__.get('score_winner') or
-                  __RET__.get('score') or __RET__.get('reward'))
-            _lm = __RET__.get('loser_model') or __RET__.get('loser')
-            _ls = __RET__.get('loser_score') or __RET__.get('score_loser')
-            if _wm is not None and _ws is not None:
-                bandit_record(str(_wm), float(_ws), True,  task_type='duel')
-            if _lm is not None and _ls is not None:
-                bandit_record(str(_lm), float(_ls), False, task_type='duel')
-        except Exception:
-            pass
-        # --- end autolog ---
-        return __RET__
 
     async def _run_candidate(self, job: dict, candidate: Dict[str, Any], task_id: str) -> Dict[str, Any]:
         try:
             return await asyncio.wait_for(self._run_candidate_inner(job, candidate, task_id), timeout=CANDIDATE_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             log.warning("candidate.timeout", {"task_id": task_id, "model": _format_model_name(candidate), "timeout_sec": CANDIDATE_TIMEOUT_SEC})
-            __RET__ = {
+            return {
                 "model": _format_model_name(candidate),
                 "success": False,
                 "latency_ms": CANDIDATE_TIMEOUT_SEC*1000,
@@ -241,22 +225,6 @@ class JobQueue:
                 "logs": {"build_stdout_tail": "", "build_stderr_tail": f"candidate timed out after {CANDIDATE_TIMEOUT_SEC}s"},
                 "artifact": ""
             }
-            # --- Bandit autolog (inserted) ---
-            try:
-                from .bandit_client import record as bandit_record
-                _wm = __RET__.get('winner_model') or __RET__.get('winner') or __RET__.get('model') or __RET__.get('chosen')
-                _ws = (__RET__.get('winner_score') or __RET__.get('score_winner') or
-                      __RET__.get('score') or __RET__.get('reward'))
-                _lm = __RET__.get('loser_model') or __RET__.get('loser')
-                _ls = __RET__.get('loser_score') or __RET__.get('score_loser')
-                if _wm is not None and _ws is not None:
-                    bandit_record(str(_wm), float(_ws), True,  task_type='duel')
-                if _lm is not None and _ls is not None:
-                    bandit_record(str(_lm), float(_ls), False, task_type='duel')
-            except Exception:
-                pass
-            # --- end autolog ---
-            return __RET__
         except asyncio.CancelledError:
             log.info("candidate.canceled", {"task_id": task_id, "model": _format_model_name(candidate)})
             raise
@@ -401,12 +369,6 @@ class JobQueue:
 
                     reward_w = 1.0 if winner.get("test_pass") else (0.5 if winner.get("compile_pass") else 0.0)
                     reward_l = 1.0 if loser.get("test_pass") else (0.5 if loser.get("compile_pass") else 0.0)
-                    # bandit: persist duel outcome (winner & loser)
-                    try:
-                        bandit_record(winner.get('model') or 'unknown', float(reward_w), True,  task_type='duel')
-                        bandit_record(loser.get('model')  or 'unknown', float(reward_l), False, task_type='duel')
-                    except Exception:
-                        pass
 
                     # bandit: log duel rewards (winner & loser)
                     try:

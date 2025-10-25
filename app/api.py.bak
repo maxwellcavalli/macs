@@ -1,10 +1,7 @@
-from __future__ import annotations
-
-import html
-
 from fastapi.responses import HTMLResponse
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from __future__ import annotations
 import uuid, json
 from fastapi import Request, APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -238,9 +235,30 @@ async def metrics_endpoint():
     # Local imports so we don't have to edit global import lines
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from starlette.responses import Response as StarletteResponse
-# --- Bandit API ---
+    try:
+        data = generate_latest()
+        return StarletteResponse(content=data, media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- dev helper: increment SSE counter ---
+@router.post("/dev/incr_sse")
+async def dev_incr_sse(reason: str = "status"):
+    from .metrics import sse_terminated_total
+    sse_terminated_total.labels(reason=reason).inc()
+    return {"ok": True, "reason": reason}
+
+# --- Bandit API (appended) ---
 try:
-    from fastapi import APIRouter, HTTPException
+    from .bandit_api import router as _bandit_router  # type: ignore
+    app.include_router(_bandit_router)
+except Exception as _e:  # pragma: no cover
+    # Do not crash if optional bandit API fails to load
+    pass
+
+# --- Bandit endpoints (inline + lazy imports) ---
+try:
+    from fastapi import Request, APIRouter, HTTPException
     _bandit_router = APIRouter()
 
     @_bandit_router.post("/v1/bandit/record")
@@ -249,18 +267,14 @@ try:
             from .bandit_store import record_event as _bandit_record_event
         except Exception:
             raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        # accept both shapes
-        model = str(payload.get("model") or payload.get("model_id") or "unknown")
+        model = str(payload.get("model") or "unknown")
         try:
             reward = float(payload.get("reward"))
         except Exception:
             raise HTTPException(status_code=422, detail="reward must be a number")
         meta = payload.get("meta") or {}
-        # keep model_id in meta when provided (helps downstream normalization)
-        if payload.get("model_id") and not payload.get("model"):
-            meta["model_id"] = str(payload["model_id"])
         _bandit_record_event(model, reward, meta)
-        return {"ok": True, "resolved_model": model}
+        return {"ok": True}
 
     @_bandit_router.get("/v1/bandit/stats")
     async def bandit_stats():
@@ -268,13 +282,62 @@ try:
             from .bandit_store import get_stats as _bandit_get_stats
         except Exception:
             raise HTTPException(status_code=503, detail="bandit_store unavailable")
-        return {"ok": True, "backend": "file", "stats": _bandit_get_stats()}
+        return {"ok": True, "stats": _bandit_get_stats()}
 
-    # Attach to the main router so main.py picks it up
-    try:
-        router.include_router(_bandit_router)
-    except Exception:
-        pass
+    # Attach to the existing FastAPI app if present
+    _app = globals().get("app")
+    if _app is not None:
+        _app.include_router(_bandit_router)
 except Exception:
     # Never break startup if optional endpoints fail
     pass
+
+
+# ===== Bandit reporting =====
+
+@app.get("/v1/bandit/report")
+async def bandit_report(request: Request, days: int = 30):
+    """
+    Return aggregated bandit stats limited to the last `days` days (epoch filter).
+    """
+    store = getattr(request.app.state, "bandit_store", None)
+    if store is None:
+        return JSONResponse({"error":"bandit store not initialized"}, status_code=503)
+
+    import time
+    cutoff = int(time.time()) - days*24*3600
+    # Best-effort: if the store has .stats() only (no param), filter in Python.
+    try:
+        items = store.stats_since(cutoff)  # if you later add it
+    except Exception:
+        items = [it for it in store.stats() if it.get("last_ts", 0) >= cutoff]
+    return {"cutoff": cutoff, "days": days, "items": items}
+
+@app.get("/v1/bandit/dashboard", response_class=HTMLResponse)
+async def bandit_dashboard(request: Request):
+    """
+    Minimal HTML dashboard for quick visual checks.
+    """
+    store = getattr(request.app.state, "bandit_store", None)
+    if store is None:
+        return HTMLResponse("<h1>Bandit</h1><p>Store not initialized.</p>", status_code=503)
+    rows = store.stats()
+    # simple inline HTML (no templates)
+    def esc(s): 
+        import html; return html.escape(str(s))
+    head = "<tr><th>model</th><th>task_type</th><th>n</th><th>wins</th><th>avg_reward</th><th>sum_reward</th><th>last_ts</th></tr>"
+    body = "\n".join(
+        f"<tr><td>{esc(r.get('model_id'))}</td><td>{esc(r.get('task_type'))}</td><td>{esc(r.get('n'))}</td>"
+        f"<td>{esc(r.get('wins'))}</td><td>{esc(r.get('avg_reward'))}</td><td>{esc(r.get('sum_reward'))}</td>"
+        f"<td>{esc(r.get('last_ts'))}</td></tr>" for r in rows
+    )
+    html = f"""
+    <html><head><meta charset='utf-8'><title>Bandit Dashboard</title>
+    <style>body{{font-family:sans-serif;margin:20px}} table{{border-collapse:collapse}} th,td{{border:1px solid #ddd;padding:6px}} th{{background:#f6f6f6}}</style>
+    </head><body>
+      <h1>Bandit Dashboard</h1>
+      <p><a href="/v1/bandit/report">/v1/bandit/report</a></p>
+      <table>{head}{body}</table>
+    </body></html>
+    """
+    return HTMLResponse(html, status_code=200)

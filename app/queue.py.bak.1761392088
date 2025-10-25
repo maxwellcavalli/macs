@@ -401,12 +401,6 @@ class JobQueue:
 
                     reward_w = 1.0 if winner.get("test_pass") else (0.5 if winner.get("compile_pass") else 0.0)
                     reward_l = 1.0 if loser.get("test_pass") else (0.5 if loser.get("compile_pass") else 0.0)
-                    # bandit: persist duel outcome (winner & loser)
-                    try:
-                        bandit_record(winner.get('model') or 'unknown', float(reward_w), True,  task_type='duel')
-                        bandit_record(loser.get('model')  or 'unknown', float(reward_l), False, task_type='duel')
-                    except Exception:
-                        pass
 
                     # bandit: log duel rewards (winner & loser)
                     try:

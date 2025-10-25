@@ -238,7 +238,7 @@ async def metrics_endpoint():
     # Local imports so we don't have to edit global import lines
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     from starlette.responses import Response as StarletteResponse
-# --- Bandit API ---
+# --- Bandit API (rebuilt) ---
 try:
     from fastapi import APIRouter, HTTPException
     _bandit_router = APIRouter()
@@ -258,7 +258,9 @@ try:
         meta = payload.get("meta") or {}
         # keep model_id in meta when provided (helps downstream normalization)
         if payload.get("model_id") and not payload.get("model"):
-            meta["model_id"] = str(payload["model_id"])
+            meta = {**meta, "model_id": str(payload["model_id"])}    if payload.get("model_id") and not payload.get("model"):
+        meta = {**meta, "model_id": str(payload["model_id"])}
+
         _bandit_record_event(model, reward, meta)
         return {"ok": True, "resolved_model": model}
 
@@ -270,11 +272,10 @@ try:
             raise HTTPException(status_code=503, detail="bandit_store unavailable")
         return {"ok": True, "backend": "file", "stats": _bandit_get_stats()}
 
-    # Attach to the main router so main.py picks it up
-    try:
-        router.include_router(_bandit_router)
-    except Exception:
-        pass
+    # Attach to the existing FastAPI app if present
+    _app = globals().get("app")
+    if _app is not None:
+        _app.include_router(_bandit_router)
 except Exception:
     # Never break startup if optional endpoints fail
     pass

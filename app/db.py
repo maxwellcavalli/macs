@@ -49,11 +49,14 @@ async def get_engine() -> AsyncEngine:
         _engine = create_async_engine(settings.database_url, pool_pre_ping=True)
     return _engine
 
+import os
+
 async def init_db():
     eng = await get_engine()
     async with eng.begin() as conn:
-        for stmt in STATEMENTS:
-            await conn.execute(text(stmt))
+        if os.getenv('DB_RUN_DDL','1') != '0':
+            for stmt in STATEMENTS:
+                await conn.execute(text(stmt))
 
 async def insert_task(conn: AsyncConnection, id, type_, language, status, template_ver=None):
     await conn.execute(text("""
