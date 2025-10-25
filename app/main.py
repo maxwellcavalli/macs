@@ -1,5 +1,6 @@
 from __future__ import annotations
 from fastapi import FastAPI
+from .sse_early_exit_mw import SSEEarlyExitMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from .api import router, hub
 from .queue import JobQueue
@@ -11,6 +12,10 @@ log = get_logger("bootstrap")
 
 app = FastAPI(title="MACS API")
 
+
+
+# Early-exit SSE when artifacts already exist
+app.add_middleware(SSEEarlyExitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
