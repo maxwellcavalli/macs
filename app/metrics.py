@@ -9,3 +9,4 @@ duel_selection_decisions_total = Counter("duel_selection_decisions_total","Duel 
 duel_rule_decisions_total = Counter("duel_rule_decisions_total","Duel decisions by rule",["rule_version"])
 
 http_latency = Histogram("http_request_duration_seconds","HTTP latencies",["route","method"])
+sse_terminated_total = Counter("sse_terminated_total","SSE terminations",["reason"])

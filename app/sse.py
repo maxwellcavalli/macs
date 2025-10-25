@@ -13,7 +13,21 @@ class StreamHub:
             self._queues[task_id].append(message)
             self._conds[task_id].notify_all()
 
-    async def stream(self, task_id: str, heartbeat_seconds: int = 10) -> AsyncIterator[str]:
+    
+
+    
+    def close(self, task_id: str) -> None:
+        """Cleanup per-task state to avoid unbounded growth."""
+        try:
+            self._queues.pop(task_id, None)
+        except Exception:
+            pass
+        try:
+            self._conds.pop(task_id, None)
+        except Exception:
+            pass
+
+async def stream(self, task_id: str, heartbeat_seconds: int = 10) -> AsyncIterator[str]:
         last = time.time()
         while True:
             async with self._conds[task_id]:

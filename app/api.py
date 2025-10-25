@@ -2,6 +2,9 @@ from __future__ import annotations
 import uuid, json
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from .db import get_engine, get_task
+import time
+import os
 from typing import Optional
 from .schemas import TaskV11, TaskStatus, FeedbackV1
 from .settings import settings
@@ -13,8 +16,10 @@ from .bandit import extract_features, feature_hash, get_stats_for_models, estima
 from .ollama_health import get_ollama_health
 from .ratelimit import check_allow, peek_state
 from .logging_setup import get_logger
+from .metrics import sse_terminated_total
 
 router = APIRouter()
+logger = get_logger(__name__)
 log = get_logger("api")
 hub: StreamHub = StreamHub()
 job_queue = None  # set in main
@@ -24,7 +29,7 @@ def _ratelimit_guard(x_api_key: str|None):
     key = x_api_key or "anon"
     ok, retry_ms = check_allow(key)
     if not ok:
-        raise HTTPException(status_code=429, detail=f"rate limit exceeded; retry in {retry_ms}ms")
+        raise HTTPException(status_code=429, detail=f"rate limit exceeded; retry in {retry_ms}ms", headers={"Retry-After": str(max(1, int((retry_ms+999)//1000)))})
 
 
 def require_api_key(x_api_key: Optional[str] = Header(None)):
@@ -139,6 +144,103 @@ async def submit_feedback(feedback: FeedbackV1, x_api_key: str | None = Header(N
 @router.get("/v1/stream/{task_id}")
 async def stream_task(task_id: uuid.UUID):
     async def event_gen():
+
+        last_check = 0.0
+        last_db_check = 0.0
         async for chunk in hub.stream(str(task_id), heartbeat_seconds=10):
+            # forward hub chunk
             yield chunk
+            # Close when 'done' (or error/canceled) shows up in the stream payload
+            if ('"status":"done"' in chunk) or ('"status":"error"' in chunk) or ('"status":"canceled"' in chunk):
+                try:
+                    hub.close(str(task_id))
+                except Exception:
+                    pass
+                try:
+                    sse_terminated_total.labels(reason="status").inc()
+                except Exception:
+                    pass
+                logger.info("sse_close", extra={"reason":"status","task_id":str(task_id)})
+                break
+            # Periodically check for artifacts as a completion signal
+            now = time.time()
+            if now - last_check >= 2.0:
+                last_check = now
+                try:
+                    # Lazy import so startup is safe even if artifacts module is absent
+                    from .artifacts import _resolve_root  # type: ignore
+                    try:
+                        pth = _resolve_root(str(task_id))
+                    except Exception:
+                        pth = None
+                    if pth and os.path.isdir(pth):
+                        yield 'event: done\ndata: {"status":"done","note":"artifacts-present"}\n\n'
+                        try:
+                            hub.close(str(task_id))
+                        except Exception:
+                            pass
+                        try:
+                            sse_terminated_total.labels(reason="artifacts").inc()
+                        except Exception:
+                            pass
+                        logger.info("sse_close", extra={"reason":"artifacts","task_id":str(task_id)})
+                        break
+                except Exception:
+                    # artifacts module not available or other error; ignore
+                    pass
+            # Poll DB for terminal status as a reliable fallback
+            if now - last_db_check >= 2.0:
+                last_db_check = now
+                eng = await get_engine()
+                async with eng.begin() as conn:
+                    row = await get_task(conn, task_id)
+                status = (row[1] if row else None)
+                if status in ("done", "error", "canceled"):
+                    yield f'event: done\ndata: {{"status":"{status}","note":"db-poll"}}\n\n'
+                    try:
+                        hub.close(str(task_id))
+                    except Exception:
+                        pass
+                    break
+        
+        # Original body below (kept for reference):
+                async for chunk in hub.stream(str(task_id), heartbeat_seconds=10):
+                    yield chunk
     return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+# --- dev helper: audit tail ---
+@router.get("/v1/audit")
+async def audit_tail(n: int = Query(default=100, ge=1, le=1000)):
+    """
+    Return last N lines from audit.log (NDJSON strings).
+    """
+    path = "./audit.log"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()[-n:]
+        return JSONResponse(content={"lines": [ln.rstrip("\n") for ln in lines]})
+    except FileNotFoundError:
+        return JSONResponse(content={"lines": []})
+
+# --- Prometheus metrics endpoint ---
+@router.get("/metrics")
+async def metrics_endpoint():
+    import os
+    if os.getenv("METRICS_PUBLIC","0") != "1":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="metrics disabled")
+    # Local imports so we don't have to edit global import lines
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from starlette.responses import Response as StarletteResponse
+    try:
+        data = generate_latest()
+        return StarletteResponse(content=data, media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- dev helper: increment SSE counter ---
+@router.post("/dev/incr_sse")
+async def dev_incr_sse(reason: str = "status"):
+    from .metrics import sse_terminated_total
+    sse_terminated_total.labels(reason=reason).inc()
+    return {"ok": True, "reason": reason}
