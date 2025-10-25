@@ -1,0 +1,15 @@
+.PHONY: rag-gold-init rag-eval
+RAG_GOLD ?= data/golden_set.jsonl
+RAG_K ?= 5
+RAG_REPORT ?= artifacts/rag_eval/report.json
+
+rag-gold-init: ; @mkdir -p data ; \
+  test -s $(RAG_GOLD) || { \
+    echo '{"query":"hello","answer_doc":"docA"}' > $(RAG_GOLD) ; \
+    echo '{"query":"world","answer_doc":"docB"}' >> $(RAG_GOLD) ; \
+    echo "Seeded $(RAG_GOLD)" ; \
+  }
+
+rag-eval: ; @mkdir -p $(dir $(RAG_REPORT)) ; \
+  python -m app.rag_eval --gold $(RAG_GOLD) --k $(RAG_K) --report $(RAG_REPORT) ; \
+  echo "Wrote $(RAG_REPORT)"

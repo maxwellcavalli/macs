@@ -1,0 +1,42 @@
+.RECIPEPREFIX := >
+SHELL := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+PY ?= python3
+
+.DEFAULT_GOAL := help
+
+API_URL ?= http://localhost:8080
+API_KEY ?= $(shell ./scripts/resolve_api_key.sh)
+
+RAG_GOLD ?= data/golden_set.jsonl
+RAG_K ?= 5
+RAG_REPORT ?= artifacts/rag_eval/report.json
+
+.PHONY: help
+help: ## Show targets
+> @awk -F':|##' '/^[a-zA-Z0-9_.-]+:.*##/{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$NF}' $(MAKEFILE_LIST)
+
+.PHONY: smoke
+smoke: ## Run API smoke test using /mnt/data/.api_key if present
+> API_URL="$(API_URL)" API_KEY="$(API_KEY)" bash tests/integration_smoke.sh
+
+.PHONY: ci-local
+ci-local: smoke ## Alias to smoke for local CI
+
+.PHONY: rag-gold-init
+rag-gold-init: ## Seed a tiny golden set if missing
+> mkdir -p data
+> test -s $(RAG_GOLD) || { \
+>   echo '{"query":"hello","answer_doc":"docA"}' > $(RAG_GOLD); \
+>   echo '{"query":"world","answer_doc":"docB"}' >> $(RAG_GOLD); \
+>   echo "Seeded $(RAG_GOLD)"; }
+
+.PHONY: rag-eval
+rag-eval: ## Run retrieval eval and write report
+> mkdir -p $(dir $(RAG_REPORT))
+> $(PY) -m app.rag_eval --gold $(RAG_GOLD) --k $(RAG_K) --report $(RAG_REPORT)
+> echo "Wrote $(RAG_REPORT)"
+
+.PHONY: otel-validate
+otel-validate: ## Rebuild API and assert OTel headers + spans
+> API_URL="$(API_URL)" bash scripts/validate_otel.sh

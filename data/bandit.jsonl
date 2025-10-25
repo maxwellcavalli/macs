@@ -55,3 +55,10 @@
 {"ts": 1761397448.0814662, "model": "unify-new-1761397448", "reward": 0.88, "meta": {"model_id": "unify-new-1761397448"}}
 {"ts": 1761397465.3264866, "model": "unify-legacy-1761397465", "reward": 0.42, "meta": {}}
 {"ts": 1761397465.3439186, "model": "unify-new-1761397465", "reward": 0.84, "meta": {"model_id": "unify-new-1761397465"}}
+{"ts": 1761403749.1968403, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "d81ddb2c-18ac-4686-ab7a-9c79a4634f7e", "mode": "single"}}
+{"ts": 1761403861.967, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "9dbd8797-c07d-4d10-b379-ba20275d9cc2", "mode": "single"}}
+{"ts": 1761404219.6006155, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "f45d2c0d-4719-490d-8f08-f7de335df359", "mode": "single"}}
+{"ts": 1761404273.3101904, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "6746cccb-01f7-494f-87f1-a2a8b682c7d8", "mode": "single"}}
+{"ts": 1761404433.6581173, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "8fca6b7e-bb47-4648-9855-6368c22d81e7", "mode": "single"}}
+{"ts": 1761404445.2317438, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "14b65d58-8948-4992-b937-b12acbcc54e1", "mode": "single"}}
+{"ts": 1761405560.1359541, "model": "llama3.1:8b", "reward": 1.0, "meta": {"src": "queue", "task_id": "f144ebd5-7d68-4a3b-aad9-00d5d58111e0", "mode": "single"}}

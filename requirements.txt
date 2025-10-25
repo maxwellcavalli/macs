@@ -17,3 +17,11 @@ opentelemetry-instrumentation-fastapi>=0.47b0
 opentelemetry-instrumentation-asgi>=0.47b0
 psycopg[binary]>=3.2,<4
 psycopg-pool>=3.2,<4
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-asgi

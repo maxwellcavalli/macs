@@ -134,9 +134,7 @@ help:          ## Show this help
 
 .PHONY: ci-local
 ci-local:      ## Run integration smoke test locally
-> API_URL?=http://localhost:8080; API_KEY?=dev-local; \
-  bash tests/integration_smoke.sh
-
+> API_URL="$(API_URL)" API_KEY="$(API_KEY)" bash tests/integration_smoke.sh
 .PHONY: ci-local
 # DUPLICATE ci-local (commented out below)
 # ci-local:      ## Run integration smoke test locally
@@ -164,3 +162,21 @@ db-clean:
 
 bandit-seed: ## Replay earlier bandit totals into the DB
 > ./scripts/bandit_seed.sh
+.PHONY: rag-eval rag-gold-init
+# RAG eval config (override as needed)
+RAG_GOLD ?= data/golden_set.jsonl
+RAG_K ?= 5
+RAG_REPORT ?= artifacts/rag_eval/report.json
+
+rag-gold-init:
+> @mkdir -p data
+> @test -s $(RAG_GOLD) || { \
+> echo '{"query":"hello","answer_doc":"docA"}' > $(RAG_GOLD); \
+> echo '{"query":"world","answer_doc":"docB"}' >> $(RAG_GOLD); \
+> echo "Seeded $(RAG_GOLD)"; \
+> }
+
+rag-eval: ## Run retrieval eval and write a JSON report
+	@mkdir -p $(dir $(RAG_REPORT))
+	@python -m app.rag_eval --gold $(RAG_GOLD) --k $(RAG_K) --report $(RAG_REPORT)
+	@echo "Wrote $(RAG_REPORT)"
