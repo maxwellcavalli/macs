@@ -1,0 +1,153 @@
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import HTMLResponse
+from typing import List, Dict, Any
+from pathlib import Path
+import json
+
+router = APIRouter()
+
+@router.api_route("/bandit", methods=["GET","HEAD"], response_class=HTMLResponse)
+async def bandit_dashboard():
+    # Tailwind CDN for a clean layout
+    html = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Bandit Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100">
+  <div class="max-w-6xl mx-auto p-6">
+    <div class="flex items-center gap-3 mb-6">
+      <h1 class="text-2xl font-semibold">Bandit Dashboard</h1>
+      <span id="backend" class="text-xs px-2 py-1 rounded-full bg-slate-800 text-slate-300">loading…</span>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <section class="rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
+        <div class="p-5 border-b border-slate-800">
+          <h2 class="text-lg text-slate-200">Stats</h2>
+          <p id="stats-err" class="text-sm text-slate-400 mt-1"></p>
+        </div>
+        <div class="p-5 overflow-x-auto">
+          <table class="min-w-full text-sm">
+            <thead class="text-slate-400 border-b border-slate-800">
+              <tr>
+                <th class="text-left py-2 pr-4">Model</th>
+                <th class="text-right py-2 px-2 font-mono">count</th>
+                <th class="text-right py-2 px-2 font-mono">sum</th>
+                <th class="text-right py-2 px-2 font-mono">avg</th>
+                <th class="text-right py-2 pl-2 font-mono">last_ts</th>
+              </tr>
+            </thead>
+            <tbody id="stats-tbody" class="divide-y divide-slate-800">
+              <tr><td colspan="5" class="py-4 text-slate-400">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="rounded-2xl border border-slate-800 bg-slate-900/60 shadow">
+        <div class="p-5 border-b border-slate-800">
+          <h2 class="text-lg text-slate-200">Recent observations</h2>
+          <p id="obs-err" class="text-sm text-slate-400 mt-1"></p>
+        </div>
+        <div id="obs-list" class="p-5 text-sm text-slate-300 font-mono grid gap-1">Loading…</div>
+      </section>
+    </div>
+    <section class="rounded-2xl border border-slate-800 bg-slate-900/60 shadow mt-6">
+      <div class="p-5">
+        <h2 class="text-lg text-slate-200">API quick links</h2>
+        <div class="mt-2 text-sky-300">
+          <a class="hover:underline mr-3" href="/v1/bandit/stats" target="_blank">/v1/bandit/stats</a>
+          <a class="hover:underline" href="/v1/bandit/observations?limit=50" target="_blank">/v1/bandit/observations?limit=50</a>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+  const $=(id)=>document.getElementById(id);
+  function renderStats(data){
+    try{
+      if(!data||!data.stats) throw new Error('no stats');
+      if(data.backend) $('backend').textContent=data.backend;
+      const s=data.stats, rows=[];
+      if(Array.isArray(s)){
+        for(const r of s){
+          const m=r.model_id||r.model||'(unknown)';
+          rows.push([m,r.n??r.count??'',r.sum_reward??r.sum??'',r.avg_reward??r.avg??'',r.last_ts??'']);
+        }
+      }else{
+        for(const m of Object.keys(s).sort()){
+          const r=s[m]||{}; rows.push([m,r.count??'',r.sum??'',r.avg??'',r.last_ts??'']);
+        }
+      }
+      $('stats-tbody').innerHTML = rows.map(r=>(
+        '<tr class="hover:bg-slate-800/40 transition">'
+        +'<td class="py-2 pr-4 font-mono text-slate-200">'+r[0]+'</td>'
+        +'<td class="py-2 px-2 text-right font-mono">'+r[1]+'</td>'
+        +'<td class="py-2 px-2 text-right font-mono">'+r[2]+'</td>'
+        +'<td class="py-2 px-2 text-right font-mono">'+r[3]+'</td>'
+        +'<td class="py-2 pl-2 text-right font-mono">'+r[4]+'</td></tr>'
+      )).join('') || '<tr><td colspan="5" class="py-4 text-slate-400">No data</td></tr>';
+    }catch(e){ $('stats-err').textContent='Stats error: '+e.message; }
+  }
+  function renderObs(data){
+    try{
+      if(!data||!Array.isArray(data.events)) throw new Error('no observations');
+      const items=data.events.slice(-20).reverse().map(ev=>{
+        const m=(ev.meta&&ev.meta.model_id)?ev.meta.model_id:ev.model;
+        return '<div>ts='+ev.ts+' · model='+m+' · reward='+ev.reward+'</div>';
+      }).join('');
+      $('obs-list').innerHTML=items||'<div class="text-slate-400">No recent events</div>';
+    }catch(e){
+      $('obs-err').textContent='Observations unavailable (file backend only in MVP).';
+      $('obs-list').innerHTML='<div class="text-slate-400">—</div>';
+    }
+  }
+  async function load(){
+    try{ const r=await fetch('/v1/bandit/stats'); renderStats(await r.json()); }catch(e){ $('stats-err').textContent='Stats fetch failed'; }
+    try{ const r2=await fetch('/v1/bandit/observations?limit=100'); if(r2.ok){ renderObs(await r2.json()); } }catch(e){}
+  } load();
+  </script>
+</body></html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+@router.api_route("/v1/bandit/observations", methods=["GET","HEAD"])
+async def bandit_observations(limit: int = Query(100, ge=1, le=500)):
+    try:
+        from .bandit_store import get_store_path
+    except Exception:
+        raise HTTPException(status_code=503, detail="bandit_store unavailable")
+    path = Path(get_store_path())
+    if not path.exists():
+        raise HTTPException(status_code=503, detail="bandit file backend not active or store missing")
+    events: List[Dict[str, Any]] = []
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        pos, chunk, buf = f.tell(), 4096, b""
+        while pos > 0 and len(events) < limit:
+            take = chunk if pos >= chunk else pos
+            pos -= take; f.seek(pos); buf = f.read(take) + buf
+            parts = buf.split(b"\n")
+            if pos > 0: buf, parts = parts[0], parts[1:]
+            else: buf = b""
+            for line in reversed(parts):
+                line=line.strip()
+                if not line: continue
+                try: events.append(json.loads(line.decode("utf-8"))); 
+                except Exception: continue
+                if len(events) >= limit: break
+    events.reverse()
+    return {"ok": True, "backend": "file", "count": len(events), "events": events}
+
+# Self-register with the main router if available (import order safe when imported from main.py)
+try:
+    from .api import router as _app_router  # type: ignore
+    _app_router.include_router(router)
+except Exception:
+    pass
+
+@router.api_route("/v1/bandit", methods=["GET","HEAD"], response_class=HTMLResponse)
+@router.api_route("/v1/bandit/", methods=["GET","HEAD"], response_class=HTMLResponse)
+async def bandit_dashboard_v1():
+    # Alias to /bandit for convenience
+    return await bandit_dashboard()

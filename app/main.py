@@ -3,6 +3,9 @@ from fastapi import FastAPI
 from .sse_early_exit_mw import SSEEarlyExitMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from .api import router, hub
+from .bandit_ui import router as bandit_ui_router
+import app.bandit_ui  # registers /bandit and /v1/bandit/observations
+
 from .queue import JobQueue
 from .logging_setup import setup_json_logging, get_logger
 from .middleware import RequestIDMiddleware
@@ -23,6 +26,7 @@ app.add_middleware(
 app.add_middleware(RequestIDMiddleware)
 
 app.include_router(router)
+app.include_router(bandit_ui_router)
 
 @app.on_event("startup")
 async def _startup():
