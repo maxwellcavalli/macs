@@ -15,3 +15,8 @@ RUN pip install -r requirements.txt
 COPY . .
 EXPOSE 8080
 CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8080","--proxy-headers"]
+
+# Canonical status guard
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+COPY sitecustomize.py /app/sitecustomize.py

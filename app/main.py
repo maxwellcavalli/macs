@@ -378,3 +378,14 @@ try:
     print("[startup] /v1/tasks/{id}/ensure_artifact enabled")
 except Exception as _e:
     print("[startup] artifact_api not enabled:", _e)
+
+# --- Canonical status middlewares (JSON + SSE) ---
+try:
+    from .middleware_canon import JSONCanonicalizerMiddleware, SSECanonicalizerMiddleware
+    if not getattr(app.state, "_canon_mw_installed", False):
+        app.add_middleware(JSONCanonicalizerMiddleware)
+        app.add_middleware(SSECanonicalizerMiddleware)
+        app.state._canon_mw_installed = True
+        print("[startup] Canonical status middlewares enabled")
+except Exception as _e:
+    print("[startup] Canonical status middlewares NOT enabled:", _e)

@@ -1,3 +1,7 @@
 services:
-  postgres:
-    ports: []   # don't publish 5432 on the host
+  api:
+    environment:
+      STATUS_GUARD_MODE: "error"   # use "fix" to auto-rewrite while hunting source
+  worker:
+    environment:
+      STATUS_GUARD_MODE: "error"
