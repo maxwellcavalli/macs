@@ -59,6 +59,6 @@ async def create_task(body: TaskCreate):
         async with engine.begin() as conn:
             await conn.execute(sql, params)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
+        raise HTTPException(status_code=500, detail=f"DB insert error: {e}")
 
     return {"task_id": tid}

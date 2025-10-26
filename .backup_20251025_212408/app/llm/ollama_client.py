@@ -29,7 +29,7 @@ async def _pull(model: str) -> None:
     async with httpx.AsyncClient(timeout=None) as cx:
         r = await cx.post(url, json=payload)
         r.raise_for_status()
-        # returns {"status":"success"} on completion
+        # returns {"status":"done"} on completion
         _ = r.json()
 
 async def ensure_model(model: str) -> None:

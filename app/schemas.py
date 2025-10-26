@@ -1,10 +1,34 @@
 from __future__ import annotations
-from pydantic import BaseModel, field_validator, Field, constr
+from pydantic import BaseModel, Field, constr, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any
 import uuid
 
 class BaseTaskModel(BaseModel):
-    @field_validator("status", mode="before")
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_status(cls, data):
+        try:
+            if isinstance(data, dict) and "status" in data:
+                raw = data["status"]
+                s = str(getattr(raw, "value", raw)).strip().lower()
+                mapping = {
+                    "succeeded": "done",
+                    "success":   "done",
+                    "completed": "done",
+                    "complete":  "done",
+                    "failed":    "error",
+                    "failure":   "error",
+                    "fail":      "error",
+                    "cancelled": "canceled",
+                }
+                data["status"] = mapping.get(s, s)
+        except Exception:
+            # best-effort only; never block model construction
+            pass
+        return data
+
+class _OldBaseTaskModel(BaseModel):
+    @field_validator("status", mode="before", check_fields=False)
     @classmethod
     def _normalize_status(cls, v):
         if v is None:

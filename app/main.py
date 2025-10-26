@@ -338,3 +338,43 @@ def create_app():
     except Exception:
         wrapped = app
     return wrapped
+# --- include final endpoint (safe import placed at end) ---
+try:
+    from .final_api import router as _final_router
+    app.include_router(_final_router)
+except Exception as _e:
+    # keep server booting even if optional module is missing
+    pass
+
+# --- include artifact ensure endpoint ---
+try:
+    from .artifact_api import router as _artifact_router
+    app.include_router(_artifact_router)
+    print("[startup] /v1/tasks/{id}/ensure_artifact enabled")
+except Exception as _e:
+    print("[startup] artifact_api not enabled:", _e)
+
+# --- attach a minimal asyncpg task_repo from env (if none present) ---
+try:
+    if not getattr(app.state, "task_repo", None):
+        from .task_repo import TaskRepo
+        app.state.task_repo = TaskRepo.from_env()
+        print("[startup] task_repo enabled (asyncpg)")
+except Exception as _e:
+    print("[startup] task_repo not enabled:", _e)
+
+# --- include JSON-safe /final endpoint (if present) ---
+try:
+    from .final_api import router as _final_router
+    app.include_router(_final_router)
+    print("[startup] /v1/tasks/{id}/final enabled")
+except Exception as _e:
+    print("[startup] final_api not enabled:", _e)
+
+# --- include ensure_artifact endpoint (if present) ---
+try:
+    from .artifact_api import router as _artifact_router
+    app.include_router(_artifact_router)
+    print("[startup] /v1/tasks/{id}/ensure_artifact enabled")
+except Exception as _e:
+    print("[startup] artifact_api not enabled:", _e)

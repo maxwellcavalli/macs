@@ -29,10 +29,6 @@ router = APIRouter()
 
 @router.post("/v1/tasks")
 async def create_task(body: TaskCreate):
-    # visible log so we know THIS handler ran
-    from datetime import datetime as _dt
-    print({"ts": _dt.utcnow().isoformat()+"Z", "msg": "create_task_fix invoked", "goal": body.input.goal[:80]}, flush=True)
-
     tid = str(uuid.uuid4())
     metadata = dict(body.metadata or {})
     metadata.setdefault("input", body.input.model_dump())
@@ -63,6 +59,6 @@ async def create_task(body: TaskCreate):
         async with engine.begin() as conn:
             await conn.execute(sql, params)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB insert error: {e}")
+        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
     return {"task_id": tid}
