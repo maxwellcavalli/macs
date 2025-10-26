@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Prompt Lab — MACS</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body class="bg-neutral-950 text-neutral-100">
+  <div id="toast" class="fixed right-4 top-4 bg-neutral-800 border border-neutral-700 rounded-xl px-3 py-2 text-sm hidden opacity-0 transition-opacity">Saved</div>
+  <div class="max-w-6xl mx-auto px-4 py-6">
+    <h1 class="text-2xl font-semibold tracking-tight">Prompt Lab <span class="text-neutral-400 text-base">— stream, compare, pick best</span></h1>
+
+    <!-- Controls -->
+    <div class="mt-4 p-4 border border-neutral-800 rounded-2xl bg-neutral-900/60">
+      <div class="grid md:grid-cols-3 gap-4">
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">API Base</label>
+          <input id="apiBase" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800" placeholder="http://127.0.0.1:8080">
+        </div>
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">API Key (x-api-key)</label>
+          <input id="apiKey" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800" placeholder="dev-...">
+        </div>
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">Model (type manually if list fails)</label>
+          <div class="flex gap-2">
+            <input list="models" id="model" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800" placeholder="e.g. qwen2.5:7b">
+            <button id="listBtn" class="px-3 py-2 rounded-xl border border-neutral-800 bg-neutral-950 text-xs">Fetch</button>
+          </div>
+          <datalist id="models"></datalist>
+        </div>
+      </div>
+
+      <div class="grid md:grid-cols-4 gap-4 mt-4">
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">Temperature</label>
+          <input id="temp" type="number" step="0.05" min="0" max="2" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800">
+        </div>
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">top_p</label>
+          <input id="top_p" type="number" step="0.05" min="0" max="1" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800">
+        </div>
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">max_tokens</label>
+          <input id="max_tokens" type="number" step="16" min="128" max="8192" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800">
+        </div>
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">Best of (N)</label>
+          <input id="bestOf" type="number" min="1" max="5" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800">
+        </div>
+      </div>
+    </div>
+
+    <!-- Prompt -->
+    <div class="mt-4">
+      <label class="block text-xs text-neutral-400 mb-1">Prompt</label>
+      <textarea id="prompt" class="w-full min-h-[160px] px-3 py-3 rounded-2xl bg-neutral-900/60 border border-neutral-800" placeholder="Ask anything… include specifics, constraints, desired format. For code, say 'return a heredoc patch' etc."></textarea>
+    </div>
+
+    <!-- Actions -->
+    <div class="mt-3 flex flex-wrap gap-2 items-center">
+      <button id="askBtn" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white">Ask</button>
+      <button id="stopBtn" disabled class="px-4 py-2 rounded-xl bg-neutral-800 text-neutral-300 border border-neutral-700">Stop</button>
+      <button id="copyBtn" class="px-4 py-2 rounded-xl bg-neutral-800 text-neutral-200 border border-neutral-700">Copy Markdown</button>
+      <button id="saveBtn" class="px-4 py-2 rounded-xl bg-neutral-800 text-neutral-200 border border-neutral-700">Download .md</button>
+      <span class="text-xs text-neutral-500 ml-2">Tip: set Temperature ≥ 0.7 for a stronger best-of effect.</span>
+    </div>
+
+    <!-- Leaderboard -->
+    <div id="scoreWrap" class="hidden mt-4 p-4 border border-neutral-800 rounded-2xl bg-neutral-900/60">
+      <b class="block mb-2">Best-of leaderboard</b>
+      <ol id="scoreList" class="list-decimal pl-6 space-y-1 text-sm"></ol>
+    </div>
+
+    <!-- Output -->
+    <div class="mt-4 grid md:grid-cols-2 gap-4">
+      <div class="p-4 border border-neutral-800 rounded-2xl bg-neutral-900/60">
+        <b>Markdown Preview</b>
+        <div id="out-md" class="prose prose-invert max-w-none mt-2"></div>
+      </div>
+      <div class="p-4 border border-neutral-800 rounded-2xl bg-neutral-900/60">
+        <b>Raw Text</b>
+        <pre id="out-raw" class="mt-2 whitespace-pre-wrap break-words text-sm"></pre>
+      </div>
+    </div>
+
+    <p class="text-xs text-neutral-500 mt-3">This page posts to <code>/v1/tasks</code> then streams <code>/v1/tasks/{id}/sse</code> with your <code>x-api-key</code>. Since it’s served by the API, CORS won’t bite.</p>
+  </div>
+
+<script>
+  // ===== state & helpers =====
+  const st = {
+    base: localStorage.getItem('apiBase') || window.location.origin,
+    key:  localStorage.getItem('apiKey')  || '',
+    model: localStorage.getItem('model')  || 'qwen2.5:7b',
+    temp: parseFloat(localStorage.getItem('temp') || '0.7'),
+    top_p: parseFloat(localStorage.getItem('top_p') || '0.95'),
+    max_tokens: parseInt(localStorage.getItem('max_tokens') || '1024', 10),
+    bestOf: parseInt(localStorage.getItem('bestOf') || '1', 10),
+    streaming: false, aborters: [],
+  };
+  function qs(id){ return document.getElementById(id); }
+  function set(k,v){ localStorage.setItem(k, String(v)); }
+  function md(s){ return marked.parse(s, {mangle:false, headerIds:false}); }
+  function toast(msg){ const t=qs('toast'); t.textContent=msg; t.classList.remove('hidden','opacity-0'); setTimeout(()=>t.classList.add('opacity-0'),1500); }
+  function applyStateToUI(){
+    qs('apiBase').value=st.base; qs('apiKey').value=st.key; qs('model').value=st.model;
+    qs('temp').value=st.temp; qs('top_p').value=st.top_p; qs('max_tokens').value=st.max_tokens; qs('bestOf').value=st.bestOf;
+  }
+  function bindInputs(){
+    ['apiBase','apiKey','model','temp','top_p','max_tokens','bestOf'].forEach(id=>{
+      qs(id).addEventListener('change', e=>{
+        const v=e.target.value;
+        if(id==='temp'||id==='top_p') st[id]=parseFloat(v);
+        else if(id==='max_tokens'||id==='bestOf') st[id]=parseInt(v,10);
+        else st[id]=v;
+        const keyMap={apiBase:'apiBase', apiKey:'apiKey', model:'model', temp:'temp', top_p:'top_p', max_tokens:'max_tokens', bestOf:'bestOf'};
+        set(keyMap[id], st[id]);
+      });
+    });
+  }
+
+  async function fetchJSON(url, init={}){ const r=await fetch(url, init); if(!r.ok){ throw new Error(`HTTP ${r.status}: ${await r.text()}`);} return r.json(); }
+
+  async function streamSSE(url, {headers={}, onEvent, signal}){
+    const res = await fetch(url, { headers: {...headers, 'Accept':'text/event-stream'}, signal });
+    if(!res.ok) throw new Error(`SSE ${res.status}`);
+    const reader = res.body.getReader(); const dec = new TextDecoder(); let buf='';
+    for(;;){
+      const {value, done} = await reader.read(); if(done) break;
+      buf += dec.decode(value, {stream:true});
+      let sep;
+      while((sep = buf.indexOf("\n\n")) !== -1){
+        const raw = buf.slice(0, sep); buf = buf.slice(sep+2);
+        const payload = raw.split("\n").filter(l=>l.startsWith("data:")).map(l=>l.slice(5).trim()).join("\n");
+        if(!payload) continue;
+        if(payload === "[DONE]"){ onEvent({done:true}); continue; }
+        try { onEvent({json: JSON.parse(payload)}); } catch { onEvent({text: payload}); }
+      }
+    }
+    onEvent({done:true});
+  }
+
+  function extractDelta(evt){
+    const j = evt && evt.json;
+    if(j){
+      if(typeof j === 'string') return j;
+      if(j.delta) return j.delta;
+      if(j.token) return j.token;
+      if(j.content) return j.content;
+      if(j.output) return j.output;
+      if(j.message && j.message.content) return j.message.content;
+      if(j.note === 'artifacts-present' || j.status === 'done') return '';
+    }
+    return (evt && evt.text) ? evt.text : '';
+  }
+
+  function clearOutput(){ qs('out-raw').textContent=''; qs('out-md').innerHTML=''; qs('scoreWrap').classList.add('hidden'); }
+
+  async function oneGeneration(prompt, seedOffset, controller){
+    const body = {
+      prompt, model: st.model,
+      options: { temperature: st.temp, top_p: st.top_p, max_tokens: st.max_tokens, seed: Date.now()+seedOffset },
+      metadata: { client: 'prompt-lab', best_of: st.bestOf }
+    };
+    const created = await fetchJSON(`${st.base}/v1/tasks`, {
+      method:'POST',
+      headers:{'content-type':'application/json','x-api-key': st.key, 'Authorization': 'Bearer ' + st.key},
+      body: JSON.stringify(body)
+    });
+    const id = created.task_id || created.id || created.taskId;
+    if(!id) throw new Error('No task_id from /v1/tasks');
+
+    let full=''; 
+    await streamSSE(`${st.base}/v1/tasks/${id}/sse`, {
+      headers:{'x-api-key': st.key, 'Authorization': 'Bearer ' + st.key},
+      onEvent: (evt)=>{
+        if(evt.done) return;
+        const delta = extractDelta(evt); if(!delta) return;
+        full += delta;
+        if(st.bestOf===1){ qs('out-raw').textContent = full; qs('out-md').innerHTML = md(full); }
+      },
+      signal: controller.signal
+    });
+    return full.trim();
+  }
+
+  function scoreAnswer(prompt, ans){
+    if(!ans) return 0;
+    const p=prompt.toLowerCase(); const a=ans.toLowerCase();
+    const stop=new Set(['with','that','this','from','into','about','each','your','have','will','their','there','then','than','also','only','just','like','make','such','some','more','most','much','very','ever','here','were','been','being','them','they','what','when','where','which','while','whose','does','done','dont',"don't",'cant',"can't",'should','would','could','need']);
+    const kw = Array.from(new Set(p.split(/[^a-z0-9]+/).filter(w=>w.length>=4 && !stop.has(w))));
+    const cover = kw.length ? kw.filter(k=>a.includes(k)).length / kw.length : 0;
+    const hasMd = /(^|\n)#{1,3}\s|\n- |\n\d+\.\s|```/.test(ans) ? 0.15 : 0;
+    const hasSteps = /\b(step|steps|then|finally|summary|do this)\b/.test(a) ? 0.1 : 0;
+    const len = Math.min(ans.length/2000, 1);
+    const codeAsk = /\b(code|patch|diff|command|curl|docker|heredoc)\b/.test(p) ? (/```/.test(ans)?0.15:0) : 0;
+    return 0.6*cover + 0.15*hasMd + 0.1*hasSteps + 0.1*len + 0.05*codeAsk;
+  }
+
+  async function onAsk(){
+    if(st.streaming) return;
+    const prompt = qs('prompt').value.trim();
+    if(!prompt) return toast('Type a prompt');
+    if(!st.base || !st.key) return toast('Set API base and API key');
+
+    st.streaming=true; qs('askBtn').disabled=true; qs('stopBtn').disabled=false; clearOutput();
+    const ctrlList=[]; st.aborters=ctrlList;
+
+    try{
+      const N = Math.max(1, st.bestOf|0);
+      if(N===1){
+        const c=new AbortController(); ctrlList.push(c);
+        const full = await oneGeneration(prompt, 0, c);
+        qs('out-raw').textContent=full; qs('out-md').innerHTML=md(full);
+      }else{
+        const tasks=[]; for(let i=0;i<N;i++){ const c=new AbortController(); ctrlList.push(c); tasks.push(oneGeneration(prompt, i, c)); }
+        const results = await Promise.allSettled(tasks);
+        const good = results.filter(r=>r.status==='fulfilled').map(r=>r.value);
+        const ranked = good.map(a=>({a, s:scoreAnswer(prompt,a)})).sort((x,y)=>y.s-x.s);
+        if(!ranked.length) throw new Error('No successful answers');
+        qs('scoreList').innerHTML = ranked.map((r,i)=>`<li><b>#${i+1}</b> — ${(r.s*100).toFixed(1)}%</li>`).join('');
+        qs('scoreWrap').classList.remove('hidden');
+        qs('out-raw').textContent = ranked[0].a; qs('out-md').innerHTML = md(ranked[0].a);
+        window._lastCandidates = ranked;
+      }
+    }catch(e){
+      const msg = (e && e.message) ? e.message : String(e);
+      qs('out-raw').textContent = msg; qs('out-md').innerHTML = md("**Error:** " + msg);
+    }finally{
+      st.streaming=false; qs('askBtn').disabled=false; qs('stopBtn').disabled=true;
+    }
+  }
+  function onStop(){ st.aborters.forEach(c=>{try{c.abort()}catch{}}); st.aborters=[]; st.streaming=false; qs('askBtn').disabled=false; qs('stopBtn').disabled=true; toast('Stopped'); }
+  function copyMarkdown(){ const t=qs('out-raw').textContent||''; navigator.clipboard.writeText(t).then(()=>toast('Copied')); }
+  function downloadMarkdown(){ const t=qs('out-raw').textContent||''; const b=new Blob([t],{type:'text/markdown'}); const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='answer.md'; a.click(); URL.revokeObjectURL(a.href); }
+  async function listModels(){
+    try{
+      // Try your API proxy first; if not implemented, fall back error is fine.
+      const j = await fetchJSON(`${st.base}/v1/ollama/tags`, { headers:{'x-api-key': st.key, 'Authorization': 'Bearer ' + st.key} });
+      const models = (j.models || j || []).map(m=> m.name || m.model || m);
+      qs('models').innerHTML = models.map(m=>`<option value="${m}">`).join('');
+      toast(`Loaded ${models.length} models`);
+    }catch{ toast('Could not fetch models; type it manually'); }
+  }
+
+  window.addEventListener('DOMContentLoaded', ()=>{
+    applyStateToUI(); bindInputs();
+    qs('askBtn').addEventListener('click', onAsk);
+    qs('stopBtn').addEventListener('click', onStop);
+    qs('copyBtn').addEventListener('click', copyMarkdown);
+    qs('saveBtn').addEventListener('click', downloadMarkdown);
+    qs('listBtn').addEventListener('click', listModels);
+  });
+</script>
+</body>
+</html>

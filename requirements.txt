@@ -25,3 +25,4 @@ opentelemetry-sdk
 opentelemetry-instrumentation-fastapi
 opentelemetry-exporter-otlp
 opentelemetry-instrumentation-asgi
+aiohttp>=3.9

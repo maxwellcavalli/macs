@@ -1,0 +1,246 @@
+from __future__ import annotations
+import uuid, json
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
+from .db import get_engine, get_task
+import time
+import os
+from typing import Optional
+from .schemas import TaskV11, TaskStatus, FeedbackV1
+from .settings import settings
+from .sse import StreamHub
+from .db import get_engine, insert_task, update_task_status, get_task
+from sqlalchemy import text
+from .registry import available_models
+from .bandit import extract_features, feature_hash, get_stats_for_models, estimate_mean
+from .ollama_health import get_ollama_health
+from .ratelimit import check_allow, peek_state
+from .logging_setup import get_logger
+from .metrics import sse_terminated_total
+
+router = APIRouter()
+logger = get_logger(__name__)
+log = get_logger("api")
+hub: StreamHub = StreamHub()
+job_queue = None  # set in main
+
+
+def _ratelimit_guard(x_api_key: str|None):
+    key = x_api_key or "anon"
+    ok, retry_ms = check_allow(key)
+    if not ok:
+        raise HTTPException(status_code=429, detail=f"rate limit exceeded; retry in {retry_ms}ms", headers={"Retry-After": str(max(1, int((retry_ms+999)//1000)))})
+
+
+def require_api_key(x_api_key: Optional[str] = Header(None)):
+    if x_api_key != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+@router.get("/health")
+async def health():
+    return {"ok": True}
+
+@router.get("/v1/ollama/health")
+async def ollama_health():
+    return await get_ollama_health()
+
+@router.get("/v1/ratelimit/check")
+async def ratelimit_check(x_api_key: str | None = Header(None), consume: int = 0):
+    key = x_api_key or "anon"
+    if consume:
+        from .ratelimit import check_allow
+        ok, retry_ms = check_allow(key)
+        status = "allowed" if ok else f"blocked (retry_in_ms={retry_ms})"
+    else:
+        status = "peek"
+    tokens, last, rps, burst = peek_state(key)
+    return {"key": key, "mode": status, "tokens": round(tokens, 3), "rps": rps, "burst": burst}
+
+@router.get("/v1/models")
+async def list_models(language: Optional[str] = None, debug: int = Query(0, ge=0, le=1)):
+    models = available_models(language)
+    if not debug:
+        return {"models": models}
+    # attach bandit mean estimates for a default feature context (based on provided language)
+    dummy_job = {
+        "input": {
+            "language": language or "any",
+            "frameworks": [],
+            "repo": {"path": "./workspace", "include": [], "exclude": []},
+            "constraints": {"max_tokens": 2048},
+            "goal": ""
+        },
+        "output_contract": {"expected_files": []}
+    }
+    feats = extract_features(dummy_job)
+    fh = feature_hash(feats)
+    full_names = [f"{m.get('name')}:{(m.get('size') if str(m.get('size','')).endswith('b') else (str(m.get('size',''))+'b' if m.get('size') else ''))}-{m.get('quant','')}".strip("-") for m in models]
+    eng = await get_engine()
+    async with eng.connect() as conn:
+        stats = await get_stats_for_models(conn, full_names, fh)
+    enriched = []
+    for m, name in zip(models, full_names):
+        runs, rs = stats.get(name, (0, 0.0))
+        enriched.append({**m, "_bandit":{"runs":runs, "mean_estimate": round(estimate_mean(runs, rs), 3)}})
+    return {"models": enriched, "_feature_hash": fh, "_features": feats}
+
+@router.post("/v1/tasks", dependencies=[Depends(require_api_key)])
+async def submit_task(task: TaskV11, request: Request, x_api_key: str | None = Header(None)):
+    eng = await get_engine()
+    async with eng.begin() as conn:
+        await insert_task(conn, task.id, task.type, task.input.language, "queued", task.prompt_template_version)
+    # robust queue lookup: module global or app.state
+    q = job_queue or getattr(request.app.state, 'job_queue', None)
+    if q is None:
+        raise HTTPException(status_code=503, detail='job queue not ready')
+    await q.submit(task.model_dump())
+    return {"task_id": str(task.id)}
+
+@router.get("/v1/tasks/{task_id}")
+async def get_task_status(task_id: uuid.UUID) -> TaskStatus:
+    eng = await get_engine()
+    async with eng.connect() as conn:
+        row = await get_task(conn, task_id)
+        if not row:
+            raise HTTPException(404, "task not found")
+        return TaskStatus(id=task_id, status=row.status, model_used=row.model_used, latency_ms=row.latency_ms, template_ver=row.template_ver)
+
+@router.post("/v1/tasks/{task_id}/cancel", dependencies=[Depends(require_api_key)])
+async def cancel_task(task_id: uuid.UUID, request: Request, x_api_key: str | None = Header(None)):
+    _ratelimit_guard(x_api_key)
+    eng = await get_engine()
+    async with eng.begin() as conn:
+        await update_task_status(conn, task_id, "canceled")
+    # cancel inflight work as well
+    q = getattr(request.app.state, 'job_queue', None)
+    if q is not None:
+        await q.cancel(str(task_id))
+    await hub.publish(str(task_id), json.dumps({"status":"canceled"}))
+    return {"ok": True}
+
+@router.post("/v1/feedback", dependencies=[Depends(require_api_key)])
+async def submit_feedback(feedback: FeedbackV1, x_api_key: str | None = Header(None)):
+    _ratelimit_guard(x_api_key)
+    eng = await get_engine()
+    async with eng.begin() as conn:
+        await conn.execute(text("""
+            INSERT INTO rewards(id, task_id, model, success, latency_ms, human_score)
+            VALUES (gen_random_uuid(), :task_id, :model, :success, :latency_ms, :human_score)
+        """), dict(task_id=str(feedback.task_id), model=feedback.model, success=feedback.success,
+                   latency_ms=feedback.latency_ms, human_score=feedback.human_score))
+        bonus = (feedback.human_score or 0) * 0.02
+        await conn.execute(text("""
+            INSERT INTO bandit_stats(model, feature_hash, runs, reward_sum, reward_sq_sum, last_updated)
+            VALUES (:model, :fh, 1, :r, :r2, now())
+            ON CONFLICT (model, feature_hash)
+            DO UPDATE SET
+                runs = bandit_stats.runs + 1,
+                reward_sum = bandit_stats.reward_sum + EXCLUDED.reward_sum,
+                reward_sq_sum = bandit_stats.reward_sq_sum + EXCLUDED.reward_sq_sum,
+                last_updated = now()
+        """), dict(model=feedback.model, fh="manual", r=(1.0 if feedback.success else 0.0)+bonus, r2=((1.0 if feedback.success else 0.0)+bonus)**2))
+    return {"ok": True}
+
+@router.get("/v1/stream/{task_id}")
+async def stream_task(task_id: uuid.UUID):
+    async def event_gen():
+
+        last_check = 0.0
+        last_db_check = 0.0
+        async for chunk in hub.stream(str(task_id), heartbeat_seconds=10):
+            # forward hub chunk
+            yield chunk
+            # Close when 'done' (or error/canceled) shows up in the stream payload
+            if ('"status":"done"' in chunk) or ('"status":"error"' in chunk) or ('"status":"canceled"' in chunk):
+                try:
+                    hub.close(str(task_id))
+                except Exception:
+                    pass
+                try:
+                    sse_terminated_total.labels(reason="status").inc()
+                except Exception:
+                    pass
+                logger.info("sse_close", extra={"reason":"status","task_id":str(task_id)})
+                break
+            # Periodically check for artifacts as a completion signal
+            now = time.time()
+            if now - last_check >= 2.0:
+                last_check = now
+                try:
+                    # Lazy import so startup is safe even if artifacts module is absent
+                    from .artifacts import _resolve_root  # type: ignore
+                    try:
+                        pth = _resolve_root(str(task_id))
+                    except Exception:
+                        pth = None
+                    if pth and os.path.isdir(pth):
+                        yield 'event: done\ndata: {"status":"done","note":"artifacts-present"}\n\n'
+                        try:
+                            hub.close(str(task_id))
+                        except Exception:
+                            pass
+                        try:
+                            sse_terminated_total.labels(reason="artifacts").inc()
+                        except Exception:
+                            pass
+                        logger.info("sse_close", extra={"reason":"artifacts","task_id":str(task_id)})
+                        break
+                except Exception:
+                    # artifacts module not available or other error; ignore
+                    pass
+            # Poll DB for terminal status as a reliable fallback
+            if now - last_db_check >= 2.0:
+                last_db_check = now
+                eng = await get_engine()
+                async with eng.begin() as conn:
+                    row = await get_task(conn, task_id)
+                status = (row[1] if row else None)
+                if status in ("done", "error", "canceled"):
+                    yield f'event: done\ndata: {{"status":"{status}","note":"db-poll"}}\n\n'
+                    try:
+                        hub.close(str(task_id))
+                    except Exception:
+                        pass
+                    break
+        
+        # Original body below (kept for reference):
+                async for chunk in hub.stream(str(task_id), heartbeat_seconds=10):
+                    yield chunk
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+# --- dev helper: audit tail ---
+@router.get("/v1/audit")
+async def audit_tail(n: int = Query(default=100, ge=1, le=1000)):
+    """
+    Return last N lines from audit.log (NDJSON strings).
+    """
+    path = "./audit.log"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()[-n:]
+        return JSONResponse(content={"lines": [ln.rstrip("\n") for ln in lines]})
+    except FileNotFoundError:
+        return JSONResponse(content={"lines": []})
+
+# --- Prometheus metrics endpoint ---
+@router.get("/metrics")
+async def metrics_endpoint():
+    import os
+    if os.getenv("METRICS_PUBLIC","0") != "1":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="metrics disabled")
+    # Local imports so we don't have to edit global import lines
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from starlette.responses import Response as StarletteResponse
+    try:
+        data = generate_latest()
+        return StarletteResponse(content=data, media_type=CONTENT_TYPE_LATEST)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# --- dev helper: increment SSE counter ---
+@router.post("/dev/incr_sse")
+async def dev_incr_sse(reason: str = "status"):
+    from .metrics import sse_terminated_total
+    sse_terminated_total.labels(reason=reason).inc()
+    return {"ok": True, "reason": reason}

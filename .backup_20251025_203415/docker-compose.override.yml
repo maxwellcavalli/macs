@@ -1,0 +1,4 @@
+version: "3.9"
+services:
+  postgres:
+    ports: []   # don't publish 5432 on the host

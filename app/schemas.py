@@ -1,7 +1,26 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, constr
+from pydantic import BaseModel, field_validator, Field, constr
 from typing import List, Optional, Literal, Dict, Any
 import uuid
+
+class BaseTaskModel(BaseModel):
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status(cls, v):
+        if v is None:
+            return v
+        s = str(getattr(v, "value", v)).strip().lower()
+        mapping = {
+            "done": "done",
+            "success": "done",
+            "completed": "done",
+            "complete": "done",
+            "error": "error",
+            "failure": "error",
+            "fail": "error",
+            "canceled": "canceled",
+        }
+        return mapping.get(s, s)
 
 TaskType = Literal["CODE","PLAN","REFACTOR","TEST","DOC"]
 
@@ -15,7 +34,7 @@ class Constraints(BaseModel):
     latency_ms: int = 60000
     style: Optional[str] = None
 
-class TaskInput(BaseModel):
+class TaskInput(BaseTaskModel):
     language: Literal["java","python","graphql"]
     frameworks: List[str] = []
     repo: RepoSpec
@@ -35,7 +54,7 @@ class Oracle(BaseModel):
     smoke: bool = True
     full: bool = False
 
-class TaskV1(BaseModel):
+class TaskV1(BaseTaskModel):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     type: TaskType
     input: TaskInput
@@ -57,7 +76,7 @@ class FeedbackV1(BaseModel):
     notes: Optional[str] = None
     artifacts: Optional[Dict[str, Any]] = None
 
-class TaskStatus(BaseModel):
+class TaskStatus(BaseTaskModel):
     id: uuid.UUID
     status: Literal["queued","running","done","error","canceled"]
     model_used: Optional[str] = None

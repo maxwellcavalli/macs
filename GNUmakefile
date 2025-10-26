@@ -40,3 +40,11 @@ rag-eval: ## Run retrieval eval and write report
 .PHONY: otel-validate
 otel-validate: ## Rebuild API and assert OTel headers + spans
 > API_URL="$(API_URL)" bash scripts/validate_otel.sh
+
+.PHONY: hardening-validate
+hardening-validate: ## Assert request size limit returns 413 with JSON error
+> API_URL="$(API_URL)" MACS_MAX_BODY_BYTES="$(MACS_MAX_BODY_BYTES)" bash scripts/validate_hardening.sh
+
+.PHONY: factory-validate
+factory-validate: ## 413 check via factory-wrapped ASGI limiter
+> API_URL="$(API_URL)" MACS_MAX_BODY_BYTES="$(MACS_MAX_BODY_BYTES)" bash scripts/validate_factory_and_limit.sh
