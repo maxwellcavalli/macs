@@ -65,7 +65,7 @@ def resolve_fields(task):
     model = pick(
         task.get("model"),
         meta_in.get("model"), meta_req.get("model"), meta.get("model"),
-        default="qwen2.5:7b"
+        default="qwen2.5-coder:7b-instruct-q4_K_M"
     )
     language = pick(
         task.get("language"),

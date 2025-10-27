@@ -1,4 +1,0 @@
-services:
-  api:
-    environment:
-      MACS_MAX_BODY_BYTES: "${MACS_MAX_BODY_BYTES}"

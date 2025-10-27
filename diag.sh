@@ -36,7 +36,7 @@ read -r -d "" BODY << "JSON"
     "language":"python",
     "repo":{"path":"."},
     "constraints":{"artifacts_required":false},
-    "model":"qwen2.5:7b",
+    "model":"qwen2.5-coder:7b-instruct-q4_K_M",
     "options":{"temperature":0.2,"top_p":0.9,"max_tokens":64,"seed":123}
   },
   "metadata":{"client":"diag","best_of":1}

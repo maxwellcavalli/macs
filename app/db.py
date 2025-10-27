@@ -64,12 +64,20 @@ async def insert_task(conn: AsyncConnection, id, type_, language, status, templa
         VALUES (:id, :type, :language, :status, :template_ver)
     """), dict(id=str(id), type=type_, language=language, status=status, template_ver=template_ver))
 
-async def update_task_status(conn: AsyncConnection, id, status, model_used=None, latency_ms=None):
-    await conn.execute(text("""
-        UPDATE tasks SET status=:status, model_used=COALESCE(:model_used, model_used),
+_UNSET = object()
+
+async def update_task_status(conn: AsyncConnection, id, status, model_used=None, latency_ms=None, error=_UNSET):
+    stmt = """
+        UPDATE tasks SET status=:status,
+                         model_used=COALESCE(:model_used, model_used),
                          latency_ms=COALESCE(:latency_ms, latency_ms)
-        WHERE id=:id
-    """), dict(id=str(id), status=status, model_used=model_used, latency_ms=latency_ms))
+    """
+    params = dict(id=str(id), status=status, model_used=model_used, latency_ms=latency_ms)
+    if error is not _UNSET:
+        stmt += ", error=:error"
+        params["error"] = error
+    stmt += " WHERE id=:id"
+    await conn.execute(text(stmt), params)
 
 async def get_task(conn: AsyncConnection, id):
     res = await conn.execute(text("""

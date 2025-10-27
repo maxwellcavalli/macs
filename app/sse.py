@@ -27,7 +27,7 @@ class StreamHub:
         except Exception:
             pass
 
-async def stream(self, task_id: str, heartbeat_seconds: int = 10) -> AsyncIterator[str]:
+    async def stream(self, task_id: str, heartbeat_seconds: int = 10) -> AsyncIterator[str]:
         last = time.time()
         while True:
             async with self._conds[task_id]:

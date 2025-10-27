@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MACS Chat Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Inter", "Segoe UI", sans-serif;
+    }
+    body {
+      background: #0f172a;
+      color: #e2e8f0;
+      margin: 0;
+    }
+    .chat-scroll {
+      scrollbar-width: thin;
+      scrollbar-color: rgba(148,163,184,0.35) transparent;
+    }
+    .chat-scroll::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    .chat-scroll::-webkit-scrollbar-thumb {
+      background-color: rgba(148,163,184,0.35);
+      border-radius: 999px;
+    }
+    pre {
+      margin: 0;
+    }
+  </style>
+</head>
+<body class="min-h-screen">
+  <div class="min-h-screen flex flex-col">
+    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur">
+      <div class="max-w-5xl mx-auto px-4 py-5 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+        <div>
+          <h1 class="text-2xl font-semibold tracking-tight">MACS Chat</h1>
+          <p class="text-sm text-slate-400">Conversational console for the multi-model router.</p>
+        </div>
+        <div class="flex flex-wrap gap-3 items-end">
+          <label class="text-xs text-slate-400 flex flex-col gap-1">
+            API Base
+            <input id="apiBase" class="w-56 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring focus:ring-indigo-500/40" placeholder="http://127.0.0.1:8080">
+          </label>
+          <label class="text-xs text-slate-400 flex flex-col gap-1">
+            API Key
+            <input id="apiKey" class="w-48 rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring focus:ring-indigo-500/40" placeholder="dev-...">
+          </label>
+          <button id="newChatBtn" class="rounded-xl border border-slate-700 bg-slate-900 px-4 py-2 text-sm text-slate-200 transition hover:bg-slate-800">New chat</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="flex-1 py-6">
+      <section class="max-w-5xl mx-auto px-4 flex flex-col gap-4 h-full">
+        <div class="flex-1 rounded-3xl border border-slate-800 bg-slate-900/60 backdrop-blur flex flex-col overflow-hidden">
+          <div id="messages" class="chat-scroll flex-1 overflow-y-auto px-6 py-6 space-y-4">
+            <div class="text-center text-sm text-slate-500">No messages yet. Say hi!</div>
+          </div>
+          <form id="composer" class="border-t border-slate-800 bg-slate-900/80 px-4 py-4 flex gap-3 items-end">
+            <textarea id="messageInput" class="flex-1 min-h-[72px] max-h-52 resize-y rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-100 focus:outline-none focus:ring focus:ring-indigo-500/40" placeholder="Type your message..."></textarea>
+            <button type="submit" id="sendBtn" class="rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50">Send</button>
+          </form>
+        </div>
+        <aside class="text-xs text-slate-400">
+          <p><span class="text-slate-200 font-medium">Tips:</span> chat requests are routed to conversational models. When the router is unsure, it will ask whether you want code or plain language.</p>
+        </aside>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    marked.setOptions({
+      gfm: true,
+      breaks: true,
+      highlight: (code, lang) => {
+        if (lang && hljs.getLanguage(lang)) {
+          return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+      }
+    });
+
+    const state = {
+      base: localStorage.getItem("chat.apiBase") || window.location.origin.replace(/\/chat\/?$/, ""),
+      key: localStorage.getItem("chat.apiKey") || "",
+      sending: false,
+      eventSource: null,
+    };
+
+    const messagesEl = document.getElementById("messages");
+    const inputEl = document.getElementById("messageInput");
+    const sendBtn = document.getElementById("sendBtn");
+    const apiBaseEl = document.getElementById("apiBase");
+    const apiKeyEl = document.getElementById("apiKey");
+    const newChatBtn = document.getElementById("newChatBtn");
+    const composerForm = document.getElementById("composer");
+
+    const conversation = [];
+
+    function applyStateToInputs() {
+      apiBaseEl.value = state.base;
+      apiKeyEl.value = state.key;
+    }
+
+    function rememberSettings() {
+      localStorage.setItem("chat.apiBase", state.base);
+      localStorage.setItem("chat.apiKey", state.key);
+    }
+
+    function clearConversation() {
+      conversation.length = 0;
+      messagesEl.innerHTML = "";
+      const ghost = document.createElement("div");
+      ghost.className = "text-center text-sm text-slate-500";
+      ghost.textContent = "Conversation cleared.";
+      messagesEl.appendChild(ghost);
+    }
+
+    function scrollMessages() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function decorateCodeBlocks(root) {
+      const blocks = root.querySelectorAll("pre > code");
+      blocks.forEach(codeEl => {
+        const pre = codeEl.parentElement;
+        const langMatch = (codeEl.className || "").match(/language-([\w.-]+)/);
+        const lang = langMatch ? langMatch[1] : codeEl.getAttribute("data-lang") || "code";
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "relative mt-4 rounded-2xl border border-slate-700 bg-slate-950/60 overflow-hidden";
+
+        const header = document.createElement("div");
+        header.className = "flex items-center justify-between border-b border-slate-800 bg-slate-900/80 px-4 py-2 text-xs uppercase tracking-wide text-slate-400";
+        const label = document.createElement("span");
+        label.textContent = lang;
+        const actions = document.createElement("div");
+        actions.className = "flex items-center gap-2";
+        const selectBtn = document.createElement("button");
+        selectBtn.type = "button";
+        selectBtn.className = "rounded border border-slate-600 bg-slate-800 px-2 py-1 text-[0.7rem] text-slate-200 hover:bg-slate-700 select-btn";
+        selectBtn.dataset.code = codeEl.textContent;
+        selectBtn.textContent = "Select";
+        const copyBtn = document.createElement("button");
+        copyBtn.type = "button";
+        copyBtn.className = "rounded border border-slate-600 bg-slate-800 px-2 py-1 text-[0.7rem] text-slate-200 hover:bg-slate-700 copy-btn";
+        copyBtn.dataset.code = codeEl.textContent;
+        copyBtn.textContent = "Copy";
+        actions.appendChild(selectBtn);
+        actions.appendChild(copyBtn);
+        header.appendChild(label);
+        header.appendChild(actions);
+
+        pre.classList.add("px-4", "py-4", "overflow-x-auto");
+
+        const parent = pre.parentElement;
+        parent.replaceChild(wrapper, pre);
+        wrapper.appendChild(header);
+        wrapper.appendChild(pre);
+      });
+    }
+
+    function renderMarkdown(target, text) {
+      const html = marked.parse(text || "");
+      target.innerHTML = html;
+      decorateCodeBlocks(target);
+      target.querySelectorAll("pre code").forEach(code => {
+        hljs.highlightElement(code);
+      });
+    }
+
+    function renderMessage(role, text, opts) {
+      const options = opts || {};
+      if (!text) text = "";
+      if (messagesEl.children.length === 1 && messagesEl.firstElementChild && messagesEl.firstElementChild.textContent.startsWith("No messages")) {
+        messagesEl.innerHTML = "";
+      }
+      const bubble = document.createElement("div");
+      bubble.className = [
+        "rounded-3xl px-4 py-4 max-w-[75%]",
+        role === "user"
+          ? "bg-indigo-600/20 border border-indigo-500/40 ml-auto"
+          : "bg-slate-900/80 border border-slate-800"
+      ].join(" ");
+
+      const header = document.createElement("div");
+      header.className = "text-[0.65rem] uppercase tracking-[0.2em] text-slate-400 mb-2";
+      header.textContent = role === "user" ? "You" : "Assistant";
+
+      const body = document.createElement("div");
+      renderMarkdown(body, text);
+
+      bubble.appendChild(header);
+      bubble.appendChild(body);
+      messagesEl.appendChild(bubble);
+      scrollMessages();
+
+      if (options.persist !== false) {
+        conversation.push({ role, content: text });
+      }
+      return { container: bubble, body };
+    }
+
+    function disableComposer(disabled) {
+      state.sending = disabled;
+      sendBtn.disabled = disabled;
+      inputEl.disabled = disabled;
+    }
+
+    function toTaskPayload(message) {
+      return {
+        type: "DOC",
+        input: {
+          language: "python",
+          frameworks: [],
+          repo: { path: "./workspace", include: [], exclude: [] },
+          constraints: { max_tokens: 1024, latency_ms: 60000 },
+          goal: message,
+        },
+        metadata: {
+          mode_hint: "chat",
+          conversation: conversation,
+        },
+        output_contract: { expected_files: [] },
+      };
+    }
+
+    async function fetchFinalResult(taskId, pendingBubble) {
+      try {
+        const resp = await fetch(`${state.base.replace(/\/$/, "")}/v1/tasks/${taskId}/final`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        const text = data.result || data.content || data.note || JSON.stringify(data, null, 2);
+        renderMarkdown(pendingBubble.body, text);
+        conversation.push({ role: "assistant", content: text });
+      } catch (err) {
+        pendingBubble.body.textContent = `Unable to fetch final response: ${err.message || err}`;
+      } finally {
+        disableComposer(false);
+      }
+    }
+
+    function attachEventStream(taskId, pendingBubble) {
+      if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+      }
+      const endpoint = `${state.base.replace(/\/$/, "")}/v1/stream/${taskId}`;
+      const es = new EventSource(endpoint);
+      state.eventSource = es;
+     const handleDone = (payload) => {
+        let text = payload.content || payload.message || payload.result || "";
+        if (!text) {
+          text = "Done (no content returned).";
+        }
+        renderMarkdown(pendingBubble.body, text);
+        conversation.push({ role: "assistant", content: text });
+        if (payload.zip_url) {
+          const link = document.createElement("a");
+          link.href = payload.zip_url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.className = "mt-3 inline-flex items-center gap-2 rounded-xl border border-indigo-400/40 bg-indigo-500/10 px-3 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/20";
+          link.textContent = "Download ZIP";
+          pendingBubble.body.appendChild(link);
+        }
+        disableComposer(false);
+        es.close();
+        state.eventSource = null;
+      };
+
+      es.addEventListener("done", evt => {
+        if (!evt.data) {
+          handleDone({});
+          return;
+        }
+        try {
+          const payload = JSON.parse(evt.data);
+          handleDone(payload);
+        } catch {
+          handleDone({});
+        }
+      });
+
+      es.onmessage = evt => {
+        if (!evt.data) return;
+        try {
+          const payload = JSON.parse(evt.data);
+          if (payload.status === "done") {
+            handleDone(payload);
+          } else if (payload.status === "error") {
+            pendingBubble.body.textContent = `Error: ${payload.error || "unknown"}`;
+            disableComposer(false);
+            es.close();
+            state.eventSource = null;
+          } else if (payload.mode === "clarify" && payload.content) {
+            renderMarkdown(pendingBubble.body, payload.content);
+            conversation.push({ role: "assistant", content: payload.content });
+            disableComposer(false);
+            es.close();
+            state.eventSource = null;
+          }
+        } catch (err) {
+          console.error("Failed to parse SSE message", err);
+        }
+      };
+      es.onerror = () => {
+        pendingBubble.body.textContent = "Still thinking… collecting the final answer for you.";
+        es.close();
+        state.eventSource = null;
+        fetchFinalResult(taskId, pendingBubble);
+      };
+    }
+
+    async function sendMessage(event) {
+      event.preventDefault();
+      if (state.sending) return;
+      const text = inputEl.value.trim();
+      if (!text) return;
+      if (!state.base) {
+        alert("Set API Base first.");
+        return;
+      }
+      disableComposer(true);
+      renderMessage("user", text);
+      inputEl.value = "";
+      const pending = renderMessage("assistant", "…", { persist: false });
+
+      try {
+        const payload = toTaskPayload(text);
+        const resp = await fetch(`${state.base.replace(/\/$/, "")}/v1/tasks`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(state.key ? { "x-api-key": state.key } : {}),
+          },
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(detail || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (!data.task_id) {
+          throw new Error("Task created but id missing.");
+        }
+        attachEventStream(data.task_id, pending);
+      } catch (err) {
+        console.error(err);
+        pending.body.textContent = `Error: ${err.message || err}`;
+        disableComposer(false);
+      }
+    }
+
+    messagesEl.addEventListener("click", async (event) => {
+      const copyBtn = event.target.closest(".copy-btn");
+      const selectBtn = event.target.closest(".select-btn");
+      if (!copyBtn && !selectBtn) return;
+      const text = (copyBtn || selectBtn).dataset.code || "";
+      if (copyBtn) {
+        try {
+          await navigator.clipboard.writeText(text);
+          copyBtn.textContent = "Copied";
+          copyBtn.classList.add("border-emerald-400", "text-emerald-200");
+          setTimeout(() => {
+            copyBtn.textContent = "Copy";
+            copyBtn.classList.remove("border-emerald-400", "text-emerald-200");
+          }, 1500);
+        } catch (err) {
+          console.error("Copy failed", err);
+          copyBtn.textContent = "Copy failed";
+          setTimeout(() => (copyBtn.textContent = "Copy"), 1500);
+        }
+      } else if (selectBtn) {
+        const wrapper = selectBtn.closest(".relative");
+        const codeBlock = wrapper ? wrapper.querySelector("pre") : null;
+        if (codeBlock) {
+          const range = document.createRange();
+          range.selectNodeContents(codeBlock);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          selectBtn.textContent = "Selected";
+          setTimeout(() => (selectBtn.textContent = "Select"), 1500);
+        }
+      }
+    });
+
+    apiBaseEl.addEventListener("change", () => {
+      state.base = apiBaseEl.value.trim();
+      rememberSettings();
+    });
+    apiKeyEl.addEventListener("change", () => {
+      state.key = apiKeyEl.value.trim();
+      rememberSettings();
+    });
+    newChatBtn.addEventListener("click", () => {
+      if (state.eventSource) {
+        state.eventSource.close();
+        state.eventSource = null;
+      }
+      clearConversation();
+      disableComposer(false);
+      inputEl.focus();
+    });
+    composerForm.addEventListener("submit", sendMessage);
+
+    applyStateToInputs();
+    inputEl.focus();
+  </script>
+</body>
+</html>

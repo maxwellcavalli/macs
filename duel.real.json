@@ -9,7 +9,7 @@
   },
   "routing_hints": {
     "duel": true,
-    "duel_candidates": ["llama3.1:8b-q4", "mistral:7b-q4"]
+    "duel_candidates": ["mistral:7b-instruct-q4_K_M", "qwen2.5-coder:7b-instruct-q4_K_M"]
   },
   "output_contract": {
     "expected_files": ["src/main/java/com/acme/DemoController.java"]

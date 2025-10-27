@@ -86,7 +86,15 @@ async def rank_models(conn: AsyncConnection, candidates: List[Dict[str, Any]], f
     return [t[0] for t in annotated]
 
 def _format_model_name(m: Dict[str, Any]) -> str:
-    size = str(m.get("size","")).lower()
-    size_tag = size if size.endswith("b") else (f"{size}b" if size else "")
-    quant = m.get("quant","")
+    tag = (m.get("tag") or "").strip()
+    if tag:
+        return tag
+    size = str(m.get("size", "")).lower()
+    if not size:
+        size_tag = ""
+    elif size.endswith("b") or "-" in size:
+        size_tag = size
+    else:
+        size_tag = f"{size}b"
+    quant = m.get("quant", "")
     return f"{m.get('name')}:{size_tag}-{quant}".strip("-")

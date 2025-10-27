@@ -27,10 +27,24 @@ async def _pull(model: str) -> None:
     url = f"{OLLAMA_HOST}/api/pull"
     payload = {"model": model, "stream": False}
     async with httpx.AsyncClient(timeout=None) as cx:
-        r = await cx.post(url, json=payload)
-        r.raise_for_status()
+        try:
+            r = await cx.post(url, json=payload)
+            r.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip()
+            msg = f"Ollama pull failed (status={exc.response.status_code})"
+            if detail:
+                msg += f": {detail}"
+            raise OllamaError(msg) from exc
         # returns {"status":"done"} on completion
-        _ = r.json()
+        try:
+            _ = r.json()
+        except json.JSONDecodeError:
+            detail = r.text.strip()
+            msg = "Ollama pull returned unexpected response format"
+            if detail:
+                msg += f": {detail[:200]}"
+            raise OllamaError(msg) from None
 
 async def ensure_model(model: str) -> None:
     try:
@@ -70,14 +84,23 @@ async def generate_stream(
         payload["options"]["temperature"] = float(temperature)
 
     async with httpx.AsyncClient(timeout=None) as cx:
-        async with cx.stream("POST", url, json=payload) as r:
-            r.raise_for_status()
-            async for line in r.aiter_lines():
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    # sometimes blank/partial lines slip; skip quietly
-                    continue
-                yield obj
+        try:
+            async with cx.stream("POST", url, json=payload) as r:
+                r.raise_for_status()
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        # sometimes blank/partial lines slip; skip quietly
+                        continue
+                    yield obj
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text.strip()
+            msg = f"Ollama generate failed (status={exc.response.status_code})"
+            if detail:
+                msg += f": {detail[:200]}"
+            raise OllamaError(msg) from exc
+        except httpx.HTTPError as exc:
+            raise OllamaError(f"Ollama generate request error: {exc}") from exc

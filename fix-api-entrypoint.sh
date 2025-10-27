@@ -49,7 +49,7 @@ class TaskInput(BaseModel):
     language: str = "python"
     repo: Dict[str, Any] = Field(default_factory=dict)
     constraints: Dict[str, Any] = Field(default_factory=dict)
-    model: str = "qwen2.5:7b"
+    model: str = "qwen2.5-coder:7b-instruct-q4_K_M"
     options: Dict[str, Any] = Field(default_factory=dict)
 
 class TaskCreate(BaseModel):

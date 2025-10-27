@@ -1,1 +1,0 @@
-{"status": "done", "mode": "single", "model": "llama3.1:8b-q4", "latency_ms": 681, "compile_pass": true, "test_pass": false, "tool": "maven", "artifact": "/app/workspace/.duel/bd88994b-1a63-47c3-b71f-95bc030a9f60/llama3.1_8b_q4/main.txt", "logs": {"build_stdout_tail": "", "build_stderr_tail": ""}}

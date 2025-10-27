@@ -4,5 +4,7 @@ __pycache__/
 .DS_Store
 .env
 workspace/
+artifacts/
+ollama/
 ops/prometheus.yml
 *.zip

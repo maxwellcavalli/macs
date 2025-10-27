@@ -1,25 +1,50 @@
 models:
+  # Router / fast generalist
+  - name: mistral
+    tag: mistral:7b-instruct-q4_K_M
+    size: 7b-instruct
+    quant: q4_K_M
+    ctx_size: 8192
+    min_vram_gb: 5
+    speed_rank: 0
+    langs: [java, python, docs, planner]
+
+  # Balanced general-purpose model (reasoning + code)
   - name: llama3.1
-    size: 8b
-    quant: q4
+    tag: llama3.1:8b-instruct-q4_K_M
+    size: 8b-instruct
+    quant: q4_K_M
     ctx_size: 8192
     min_vram_gb: 6
     speed_rank: 1
     langs: [java, python, docs, planner]
 
-  - name: mistral
-    size: 7b
-    quant: q4
-    ctx_size: 8192
-    min_vram_gb: 5
-    speed_rank: 2
-    langs: [java, python, docs]
-
-  # Keep a bigger model available but de-prioritized (will be slow on 8 GiB)
+  # Code specialist for deeper refactors/tests
   - name: qwen2.5-coder
-    size: 14b
-    quant: q4
+    tag: qwen2.5-coder:7b-instruct-q4_K_M
+    size: 7b-instruct
+    quant: q4_K_M
     ctx_size: 8192
-    min_vram_gb: 12
-    speed_rank: 9
-    langs: [java, python, docs]
+    min_vram_gb: 8
+    speed_rank: 4
+    langs: [java, python]
+
+  # Documentation / explanation specialist
+  - name: gemma2
+    tag: gemma2:9b-instruct-q4_K_M
+    size: 9b-instruct
+    quant: q4_K_M
+    ctx_size: 8192
+    min_vram_gb: 10
+    speed_rank: 5
+    langs: [docs, planner]
+
+  # Planning / long-context helper
+  - name: deepseek-coder
+    tag: deepseek-coder:6.7b-instruct-q4_K_M
+    size: 6.7b-instruct
+    quant: q4_K_M
+    ctx_size: 8192
+    min_vram_gb: 8
+    speed_rank: 5
+    langs: [planner, python]

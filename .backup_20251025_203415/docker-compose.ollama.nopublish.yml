@@ -1,7 +1,0 @@
-version: "3.9"
-services:
-  ollama:
-    ports: []   # no host binding for 11434
-  api:
-    environment:
-      - OLLAMA_HOST=http://ollama:11434

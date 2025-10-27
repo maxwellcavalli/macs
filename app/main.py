@@ -50,6 +50,7 @@ from .bandit_stats_api import router as bandit_stats_router
 from .bandit_ui import router as bandit_ui_router
 import app.bandit_ui  # registers /bandit and /v1/bandit/observations
 from .queue import JobQueue
+from .db import init_db
 from .logging_setup import setup_json_logging, get_logger
 from .middleware import RequestIDMiddleware
 setup_json_logging()
@@ -58,6 +59,8 @@ app = FastAPI(title="MACS API")
 
 # Serve Tailwind Prompt Lab at /lab
 app.mount("/lab", StaticFiles(directory="app/static/lab", html=True), name="lab")
+# Serve chat UI at /chat
+app.mount("/chat", StaticFiles(directory="app/static/chat", html=True), name="chat")
 enable_otel_headers(app)  # INLINE_OTEL_PATCH_v1
 # Early-exit SSE when artifacts already exist
 app.add_middleware(SSEEarlyExitMiddleware)
@@ -71,6 +74,12 @@ app.include_router(bandit_stats_router)
 app.include_router(bandit_ui_router)
 @app.on_event("startup")
 async def _startup():
+    try:
+        await init_db()
+        log.info("db.init_ok")
+    except Exception as exc:
+        log.error("db.init_failed", {"err": str(exc)})
+        raise
     # create and start the queue
     jobq = JobQueue(hub)
     await jobq.start()

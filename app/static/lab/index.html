@@ -27,7 +27,7 @@
         <div>
           <label class="block text-xs text-neutral-400 mb-1">Model</label>
           <div class="flex gap-2">
-            <input list="models" id="model" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800" placeholder="e.g. qwen2.5:7b">
+            <input list="models" id="model" class="w-full px-3 py-2 rounded-xl bg-neutral-950 border border-neutral-800" placeholder="e.g. qwen2.5-coder:7b-instruct-q4_K_M">
             <button id="listBtn" class="px-3 py-2 rounded-xl border border-neutral-800 bg-neutral-950 text-xs">Fetch</button>
           </div>
           <datalist id="models"></datalist>
@@ -131,7 +131,7 @@
   const st = {
     base: localStorage.getItem('apiBase') || window.location.origin,
     key:  localStorage.getItem('apiKey')  || '',
-    model: localStorage.getItem('model')  || 'qwen2.5:7b',
+    model: localStorage.getItem('model')  || 'qwen2.5-coder:7b-instruct-q4_K_M',
     temp: parseFloat(localStorage.getItem('temp') || '0.7'),
     top_p: parseFloat(localStorage.getItem('top_p') || '0.95'),
     max_tokens: parseInt(localStorage.getItem('max_tokens') || '1024', 10),
@@ -231,6 +231,36 @@
     }
   }
 
+  async function fetchFinalContent(taskId){
+    const pickText = (data) => {
+      if(!data) return '';
+      const candidates = [
+        data.result,
+        data.content,
+        data.text,
+        data.output,
+        data.message && typeof data.message === 'string' ? data.message : undefined,
+        data.message && data.message.content ? data.message.content : undefined,
+        data.note && typeof data.note === 'string' ? data.note : undefined,
+      ];
+      for(const val of candidates){
+        if(typeof val === 'string' && val.trim()){
+          return val.trim();
+        }
+      }
+      return '';
+    };
+
+    try{
+      const final = await fetchJSON(`${st.base}/v1/tasks/${taskId}/final`);
+      const picked = pickText(final);
+      if(picked) return picked;
+    }catch(err){
+      console.warn('final fetch failed', err);
+    }
+    return '';
+  }
+
   // NEW schema body
   async function oneGeneration(goal, seedOffset, controller){
     const repoObj = parseJSONOrThrow(qs('repo').value || "{}", "Repo");
@@ -257,16 +287,43 @@
     if(!id) throw new Error('No task_id from /v1/tasks');
 
     let full='';
+    let finalText='';
+    let sawTerminal=false;
     await streamSSE(`${st.base}/v1/tasks/${id}/sse`, {
       onEvent: (evt)=>{
         if(evt.done) return;
+        const data = evt && evt.json ? evt.json : null;
+        if(data){
+          const status = String(data.status || '').toLowerCase();
+          const note = String(data.note || '').toLowerCase();
+          if(typeof data.content === 'string' && data.content.trim()){
+            finalText = data.content.trim();
+          }else if(typeof data.result === 'string' && data.result.trim()){
+            finalText = data.result.trim();
+          }
+          if(status === 'done' || status === 'error' || status === 'canceled' || note === 'artifacts-present'){
+            sawTerminal = true;
+          }
+        }
         const delta = extractDelta(evt); if(!delta) return;
         full += delta;
         if(st.bestOf===1){ qs('out-raw').textContent = full; qs('out-md').innerHTML = md(full); }
       },
       signal: controller.signal
     });
-    return full.trim();
+    if(!finalText.trim()){
+      finalText = full.trim();
+    }
+    if((!finalText || !finalText.trim()) && sawTerminal){
+      const fetched = await fetchFinalContent(id);
+      if(fetched) finalText = fetched;
+    }
+    const output = finalText.trim() || full.trim();
+    if(st.bestOf===1 && output){
+      qs('out-raw').textContent = output;
+      qs('out-md').innerHTML = md(output);
+    }
+    return output;
   }
 
   function scoreAnswer(prompt, ans){

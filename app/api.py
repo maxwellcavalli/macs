@@ -4,6 +4,7 @@ import html
 
 from fastapi.responses import HTMLResponse
 from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uuid, json
 from fastapi import Request, APIRouter, Depends, Header, HTTPException, Query, Request
@@ -11,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from .db import get_engine, get_task
 import time
 import os
+from pathlib import Path
 from typing import Optional
 from .schemas import TaskV11, TaskStatus, FeedbackV1
 from .settings import settings
@@ -29,6 +31,8 @@ logger = get_logger(__name__)
 log = get_logger("api")
 hub: StreamHub = StreamHub()
 job_queue = None  # set in main
+
+ZIP_ROOT = Path(os.getenv("ZIP_DIR", "/data/zips"))
 
 
 def _ratelimit_guard(x_api_key: str|None):
@@ -180,7 +184,18 @@ async def stream_task(task_id: uuid.UUID):
                     except Exception:
                         pth = None
                     if pth and os.path.isdir(pth):
-                        yield 'event: done\ndata: {"status":"done","note":"artifacts-present"}\n\n'
+                        payload = {"status": "done", "note": "artifacts-present"}
+                        try:
+                            res_path = Path(pth) / "result.json"
+                            if res_path.is_file():
+                                data = json.loads(res_path.read_text(encoding="utf-8"))
+                                for key in ("content", "zip_url", "artifact", "model", "tool", "logs"):
+                                    value = data.get(key)
+                                    if value not in (None, ""):
+                                        payload[key] = value
+                        except Exception:
+                            pass
+                        yield f'event: done\ndata: {json.dumps(payload)}\n\n'
                         try:
                             hub.close(str(task_id))
                         except Exception:
@@ -202,17 +217,42 @@ async def stream_task(task_id: uuid.UUID):
                     row = await get_task(conn, task_id)
                 status = (row[1] if row else None)
                 if status in ("done", "error", "canceled"):
-                    yield f'event: done\ndata: {{"status":"{status}","note":"db-poll"}}\n\n'
+                    payload = {"status": status, "note": "db-poll"}
+                    try:
+                        from .artifacts import _resolve_root  # type: ignore
+                        root = _resolve_root(str(task_id))
+                        res_path = Path(root) / "result.json"
+                        if res_path.is_file():
+                            data = json.loads(res_path.read_text(encoding="utf-8"))
+                            for key in ("content", "zip_url", "artifact", "model", "tool", "logs"):
+                                value = data.get(key)
+                                if value not in (None, ""):
+                                    payload[key] = value
+                    except Exception:
+                        pass
+                    yield f'event: done\ndata: {json.dumps(payload)}\n\n'
                     try:
                         hub.close(str(task_id))
                     except Exception:
                         pass
                     break
         
-        # Original body below (kept for reference):
-                async for chunk in hub.stream(str(task_id), heartbeat_seconds=10):
-                    yield chunk
     return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+@router.get("/zips/{filename}")
+async def download_zip(filename: str):
+    file_path = ZIP_ROOT / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="zip not found")
+    return FileResponse(file_path, media_type="application/zip", filename=filename)
+
+@router.get("/v1/tasks/{task_id}/zip")
+async def download_task_zip(task_id: uuid.UUID):
+    filename = f"{task_id}.zip"
+    file_path = ZIP_ROOT / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="zip not found")
+    return FileResponse(file_path, media_type="application/zip", filename=filename)
 
 # --- dev helper: audit tail ---
 @router.get("/v1/audit")

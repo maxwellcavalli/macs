@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pathlib import Path
 from typing import Any, Mapping
+import json
 from .artifacts import _resolve_root
 
 router = APIRouter()
@@ -31,6 +32,17 @@ def _read_first_text(root: Path | None) -> str:
             except Exception: pass
     return ""
 
+def _load_result_payload(root: Path | None) -> dict[str, Any]:
+    if not root or not root.exists() or not root.is_dir():
+        return {}
+    p = root / "result.json"
+    if not p.is_file():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 def _row_to_payload(row: Any, task_id: str) -> dict[str, Any]:
     if row is None: return {}
     if isinstance(row, Mapping): d = dict(row)
@@ -50,12 +62,25 @@ async def get_task_final(task_id: str, request: Request):
         if repo and hasattr(repo, "get_by_id"):
             row = await repo.get_by_id(task_id)
             if row:
-                return JSONResponse(_row_to_payload(row, task_id))
+                payload = _row_to_payload(row, task_id)
+                extra = _load_result_payload(_resolve_root(task_id))
+                if extra:
+                    if extra.get("content"):
+                        payload.setdefault("result", extra.get("content"))
+                    if extra.get("zip_url"):
+                        payload["zip_url"] = extra.get("zip_url")
+                return JSONResponse(payload)
     except Exception:
         pass
     # 2) Fallback to artifacts
     root = _resolve_root(task_id)
     text = _read_first_text(root)
-    if text or (root and root.exists()):
-        return JSONResponse({"id": task_id, "status": "done", "result": text, "note": "fallback-artifacts"})
+    extra = _load_result_payload(root)
+    if text or extra or (root and root.exists()):
+        payload = {"id": task_id, "status": "done", "result": text, "note": "fallback-artifacts"}
+        if extra.get("zip_url"):
+            payload["zip_url"] = extra["zip_url"]
+        if not payload["result"] and extra.get("content"):
+            payload["result"] = extra["content"]
+        return JSONResponse(payload)
     raise HTTPException(status_code=404, detail="task not found")

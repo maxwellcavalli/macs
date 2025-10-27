@@ -1,6 +1,6 @@
 from __future__ import annotations
 from .bandit_client import record as bandit_record
-import asyncio, time, json, textwrap, os, re
+import asyncio, time, json, textwrap, os, re, traceback
 from typing import Dict, Any, List, Tuple
 from pathlib import Path
 from .sse import StreamHub
@@ -22,20 +22,159 @@ from .logctx import set_task_id, set_candidate
 # additions
 from .bandit_store import record_event as bandit_record_event
 from .artifacts import write_result
+from .zips import write_zip
 
 log = get_logger("queue")
 
 FENCE_RX = re.compile(r"^\s*```.*$")
 PACKAGE_LINE_RX = re.compile(r"^\s*package\s+([a-zA-Z0-9_.]+)\s*;\s*$")
 
-CANDIDATE_TIMEOUT_SEC = int(os.getenv("CANDIDATE_TIMEOUT_SEC", "60"))
+CODE_KEYWORDS = {
+    "implement","fix","bug","refactor","function","class","module","api","endpoint",
+    "write code","generate code","compile","build","test","unit test","integration test",
+    "sql","schema","service","controller","handler","repository",
+    "project","projects","skeleton","scaffold","structure","template","setup","zip","archive"
+}
+DOC_KEYWORDS = {"document","docs","documentation","explain","tutorial","guide","readme","summary","describe","notes"}
+PLANNER_KEYWORDS = {"plan","outline","steps","strategy","roadmap","analysis","approach","design"}
+CHAT_KEYWORDS = {"hello","hi","hey","greetings","thanks","how are","say","tell me","question","what is","who is","help me understand","conversation","chat"}
+
+MODE_PREFERENCES = {
+    "chat": [
+        "llama3.1:8b-instruct-q4_K_M",
+        "mistral:7b-instruct-q4_K_M",
+        "gemma2:9b-instruct-q4_K_M",
+    ],
+    "docs": [
+        "gemma2:9b-instruct-q4_K_M",
+        "llama3.1:8b-instruct-q4_K_M",
+        "mistral:7b-instruct-q4_K_M",
+    ],
+    "planner": [
+        "deepseek-coder:6.7b-instruct-q4_K_M",
+        "llama3.1:8b-instruct-q4_K_M",
+        "mistral:7b-instruct-q4_K_M",
+    ],
+    "code": [
+        "qwen2.5-coder:7b-instruct-q4_K_M",
+        "deepseek-coder:6.7b-instruct-q4_K_M",
+        "llama3.1:8b-instruct-q4_K_M",
+        "mistral:7b-instruct-q4_K_M",
+    ],
+}
+
+CANDIDATE_TIMEOUT_SEC = int(os.getenv("CANDIDATE_TIMEOUT_SEC", "180"))
 DUEL_TIMEOUT_SEC = int(os.getenv("DUEL_TIMEOUT_SEC", "120"))
 
+CODE_BLOCK_RE = re.compile(r"```([\w.+-]*)\n([\s\S]*?)```", re.MULTILINE)
+PATH_HINT_RE = re.compile(r"(?:^|\b)(?:file|path)\s*[:=]\s*([\w./\\-]+)", re.IGNORECASE)
+
+def _sanitize_rel_path(path: str) -> str:
+    path = path.strip().replace("\\", "/").lstrip("./")
+    parts = [p for p in path.split("/") if p and p not in (".", "..")]
+    return "/".join(parts) if parts else "output.txt"
+
+def _extract_files_from_content(text: str) -> Dict[str, str]:
+    files: Dict[str, str] = {}
+    if not text:
+        return files
+    for match in CODE_BLOCK_RE.finditer(text):
+        body = match.group(2)
+        lines = body.splitlines()
+        path = None
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines:
+            first = lines[0].strip()
+            m = PATH_HINT_RE.match(first)
+            if m:
+                path = _sanitize_rel_path(m.group(1))
+                lines = lines[1:]
+        if not path:
+            context = text[:match.start()].splitlines()
+            for line in reversed(context[-4:]):
+                m = PATH_HINT_RE.search(line)
+                if m:
+                    path = _sanitize_rel_path(m.group(1))
+                    break
+        if not path:
+            continue
+        content = "\n".join(lines).rstrip() + "\n"
+        files[path] = content
+    return files
+
 def _format_model_name(m: Dict[str, Any]) -> str:
-    size = str(m.get("size","")).lower()
-    size_tag = size if size.endswith("b") else (f"{size}b" if size else "")
-    quant = m.get("quant","")
+    tag = (m.get("tag") or "").strip()
+    if tag:
+        return tag
+    size = str(m.get("size", "")).lower()
+    if not size:
+        size_tag = ""
+    elif size.endswith("b") or "-" in size:
+        size_tag = size
+    else:
+        size_tag = f"{size}b"
+    quant = m.get("quant", "")
     return f"{m.get('name')}:{size_tag}-{quant}".strip("-")
+
+def _order_models_for_mode(mode: str, models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    prefs = MODE_PREFERENCES.get(mode, [])
+    index = {tag: idx for idx, tag in enumerate(prefs)}
+    def sort_key(m: Dict[str, Any]) -> Tuple[int, int]:
+        tag = _format_model_name(m)
+        return (index.get(tag, len(prefs)), int(m.get("speed_rank", 999)))
+    return sorted(models, key=sort_key)
+
+def _infer_mode(job: Dict[str, Any]) -> str:
+    meta = job.get("metadata") or {}
+    hint = str(meta.get("mode_hint") or meta.get("mode") or "").strip().lower()
+    if hint in {"chat","code","docs","planner"}:
+        return hint
+    job_type = str(job.get("type", "")).upper()
+    inp = job.get("input") or {}
+    goal = str(inp.get("goal", "")).strip()
+    goal_l = goal.lower()
+    output_contract = job.get("output_contract") or {}
+    expected = output_contract.get("expected_files") or []
+    repo = inp.get("repo") or {}
+    include = repo.get("include") or []
+    code_structure = bool(expected or include)
+
+    code_clues = (
+        job_type in {"CODE", "TEST", "REFACTOR"}
+        or code_structure
+        or any(kw in goal_l for kw in CODE_KEYWORDS)
+    )
+    doc_clues = job_type == "DOC" or any(kw in goal_l for kw in DOC_KEYWORDS)
+    planner_clues = job_type == "PLAN" or any(kw in goal_l for kw in PLANNER_KEYWORDS)
+    chat_clues = (
+        any(kw in goal_l for kw in CHAT_KEYWORDS)
+        or (goal and len(goal.split()) <= 8 and not code_clues)
+    )
+
+    if code_clues and (doc_clues or planner_clues or chat_clues):
+        return "clarify"
+    if code_clues:
+        return "code"
+    if doc_clues and not planner_clues:
+        return "docs"
+    if planner_clues and not doc_clues:
+        return "planner"
+    if chat_clues:
+        return "chat"
+    if doc_clues:
+        return "docs"
+    if planner_clues:
+        return "planner"
+    return "chat"
+
+def _clarify_message(job: Dict[str, Any]) -> str:
+    goal = str((job.get("input") or {}).get("goal", "")).strip()
+    snippet = goal if goal else "your request"
+    return (
+        f"I can either share a code example or answer in plain language. "
+        f"Would you like me to provide code or a conversational reply for: \"{snippet}\"?"
+    )
 
 def _derive_java_pkg_class(rel_path: str) -> Tuple[str, str]:
     parts = rel_path.strip("/").split("/")
@@ -52,10 +191,53 @@ def _derive_java_pkg_class(rel_path: str) -> Tuple[str, str]:
         return pkg, cls
 
 def _build_prompt(job: dict) -> str:
-    lang = job["input"]["language"]
-    goal = job["input"].get("goal","Generate code.")
-    frameworks = ", ".join(job["input"].get("frameworks", [])) or "none"
+    mode = job.get("_mode", "code")
+    inp = job.get("input") or {}
+    goal = inp.get("goal", "Provide assistance.")
+    frameworks = ", ".join(inp.get("frameworks", [])) or "none"
     expected_files = (job.get("output_contract") or {}).get("expected_files", [])
+
+    if mode == "chat":
+        meta = job.get("metadata") or {}
+        history_items = []
+        for entry in (meta.get("conversation") or [])[-6:]:
+            role = entry.get("role", "user")
+            content = str(entry.get("content", "")).strip()
+            if not content:
+                continue
+            label = "User" if role == "user" else "Assistant"
+            history_items.append(f"{label}: {content}")
+        history_block = "\n".join(history_items)
+        history_section = f"Conversation so far:\n{history_block}\n\n" if history_block else ""
+        return textwrap.dedent(f"""
+        You are a friendly engineering assistant. Answer in natural language, keep responses concise, and avoid writing source code unless the user clearly asks for it.
+        When the user requests code, files, scaffolds, or archives, emit the actual file contents. For every file:
+          - Add a line 'File: relative/path.ext' (relative to project root).
+          - Follow with a fenced code block containing the file body.
+          - Do NOT reference external download links or say 'see attached zip'; provide the real content inline instead.
+        {history_section}Latest user message: {goal}
+        """).strip()
+
+    if mode == "docs":
+        return textwrap.dedent(f"""
+        You are a senior developer advocate. Write a clear, structured explanation or documentation snippet that addresses the user's goal.
+        Use concise paragraphs and bullet lists when helpful. Avoid generating executable code unless explicitly requested.
+
+        Topic:
+        {goal}
+        """).strip()
+
+    if mode == "planner":
+        return textwrap.dedent(f"""
+        You are a staff engineer preparing a plan. Produce a numbered list of actionable steps, dependencies, and considerations to tackle the user's request.
+        Highlight risks or unknowns where relevant. Avoid writing full code implementations.
+
+        Planning target:
+        {goal}
+        """).strip()
+
+    # default: code mode
+    lang = inp.get("language", "general")
     files_str = "\n".join(f"- {p}" for p in expected_files) if expected_files else "- (decide suitable path)"
     pkg_hint, cls_hint = _derive_java_pkg_class(expected_files[0]) if (expected_files and expected_files[0].endswith(".java")) else ("", "")
     return textwrap.dedent(f"""
@@ -66,8 +248,11 @@ def _build_prompt(job: dict) -> str:
     Package: {pkg_hint if pkg_hint else "(decide reasonable)"}
     ClassName: {cls_hint if cls_hint else "(decide reasonable)"}
 
-    CRITICAL:
-    - Return ONLY the file contents (no backticks, no prose).
+    CRITICAL OUTPUT FORMAT:
+    - For every file you create, write a line 'File: relative/path.ext' followed immediately by a fenced code block containing the entire file contents.
+    - Emit all required files directly; do NOT reference external URLs or say that a zip was generated.
+    - If multiple directories are needed, encode them via the relative paths (e.g., File: src/main/java/App.java).
+    - Return ONLY these file blocks (no extra commentary outside fences).
     - For Java: include a correct package line and a compilable type.
     - Prefer plain JDK APIs (no third-party).
     """).strip()
@@ -132,7 +317,16 @@ class JobQueue:
 
     def _write_artifact_safely(self, task_id: str, payload: Dict[str, Any]) -> None:
         try:
-            write_result(str(task_id), payload)
+            root = write_result(str(task_id), payload)
+            text = None
+            for key in ("content", "text", "result"):
+                val = payload.get(key)
+                if isinstance(val, str) and val.strip():
+                    text = val
+                    break
+            if text:
+                target = Path(root) / "result.md"
+                target.write_text(text, encoding="utf-8")
         except Exception:
             pass
 
@@ -141,6 +335,7 @@ class JobQueue:
         model_str = _format_model_name(candidate)
         set_candidate(model_str)
         t0 = time.time()
+        mode = job.get("_mode", "code")
 
         # isolated dir
         from .fs_sandbox import resolve_safe_path
@@ -154,7 +349,16 @@ class JobQueue:
 
         # target path
         expected = (job.get("output_contract") or {}).get("expected_files", []) or []
-        rel_primary = expected[0] if expected else "main.txt"
+        if expected:
+            rel_primary = expected[0]
+        elif mode == "chat":
+            rel_primary = "response.md"
+        elif mode == "docs":
+            rel_primary = "documentation.md"
+        elif mode == "planner":
+            rel_primary = "plan.md"
+        else:
+            rel_primary = "main.txt"
 
         # prompt + stream
         prompt = _build_prompt(job)
@@ -173,8 +377,28 @@ class JobQueue:
             generated = f"// runtime error: {e}\n"
 
         # sanitize + write
-        to_write = _sanitize_java(generated, rel_primary) if rel_primary.endswith(".java") else generated
-        primary_path = await self._write_primary(rel_primary, dir_path, to_write)
+        raw_output = generated
+        if mode == "code" and rel_primary.endswith(".java"):
+            to_write = _sanitize_java(raw_output, rel_primary)
+        else:
+            to_write = raw_output
+
+        files_map = _extract_files_from_content(raw_output)
+        if rel_primary in files_map:
+            files_map[rel_primary] = to_write
+        if not files_map:
+            files_map = {rel_primary: to_write}
+        elif rel_primary not in files_map:
+            new_map: Dict[str, str] = {rel_primary: to_write}
+            new_map.update(files_map)
+            files_map = new_map
+
+        primary_rel = next(iter(files_map))
+        primary_path = await self._write_primary(primary_rel, dir_path, files_map[primary_rel])
+        for rel, data in files_map.items():
+            if rel == primary_rel:
+                continue
+            await self._write_primary(rel, dir_path, data)
 
         # Build & tests
         compile_pass = False
@@ -183,18 +407,37 @@ class JobQueue:
         err_tail = ""
         tool_used = "maven"
 
-        if primary_path.suffix.lower() == ".java":
-            c, t, o, e, tool = await build_and_test_java(dir_path)
-            compile_pass, test_pass, out_tail, err_tail, tool_used = c, t, o, e, tool
+        if mode == "code":
+            if primary_path.suffix.lower() == ".java":
+                c, t, o, e, tool = await build_and_test_java(dir_path)
+                compile_pass, test_pass, out_tail, err_tail, tool_used = c, t, o, e, tool
+            else:
+                compile_pass = bool(to_write.strip())
+                test_pass = False
+                tool_used = candidate.get("tool", "code")
         else:
             compile_pass = bool(to_write.strip())
             test_pass = False
+            tool_used = mode
 
         if compile_pass: compile_pass_total.inc()
         if test_pass:    test_smoke_pass_total.inc()
 
         latency_ms = int((time.time() - t0) * 1000)
 
+        content = to_write if to_write is not None else ""
+        zip_path = None
+        zip_url = None
+        try:
+            zip_files = dict(files_map)
+            zip_files.setdefault("response.md", content if content is not None else "")
+            if any(v.strip() for v in zip_files.values()):
+                zip_file = write_zip(str(task_id), zip_files)
+                zip_path = str(zip_file)
+                zip_url = f"/zips/{zip_file.name}"
+        except Exception:
+            zip_path = None
+            zip_url = None
         __RET__ = {
             "model": model_str,
             "success": bool(test_pass or compile_pass),
@@ -205,7 +448,10 @@ class JobQueue:
             "test_pass": bool(test_pass),
             "tool": tool_used,
             "logs": {"build_stdout_tail": out_tail, "build_stderr_tail": err_tail},
-            "artifact": str(primary_path)
+            "artifact": str(primary_path),
+            "content": content,
+            "zip_path": zip_path,
+            "zip_url": zip_url
         }
         # --- Bandit autolog (inserted) ---
         try:
@@ -239,7 +485,8 @@ class JobQueue:
                 "test_pass": False,
                 "tool": "timeout",
                 "logs": {"build_stdout_tail": "", "build_stderr_tail": f"candidate timed out after {CANDIDATE_TIMEOUT_SEC}s"},
-                "artifact": ""
+                "artifact": "",
+                "content": ""
             }
             # --- Bandit autolog (inserted) ---
             try:
@@ -273,18 +520,55 @@ class JobQueue:
             id = job["id"]
             set_task_id(str(id))
             language = job["input"]["language"]
+            mode = _infer_mode(job)
+            job["_mode"] = mode
             self._inflight[str(id)] = []
-            await self.hub.publish(str(id), json.dumps({"status":"running"}))
+            await self.hub.publish(str(id), json.dumps({"status":"running", "mode": mode}))
+
+            if mode == "clarify":
+                question = _clarify_message(job)
+                self._write_artifact_safely(str(id), {
+                    "status": "done",
+                    "mode": "clarify",
+                    "model": "router-clarify",
+                    "content": question
+                })
+                try:
+                    async with eng.begin() as conn:
+                        await update_task_status(conn, id, "done", model_used="router-clarify", latency_ms=0)
+                except Exception:
+                    pass
+                await self.hub.publish(str(id), json.dumps({
+                    "status": "done",
+                    "mode": "clarify",
+                    "message": question,
+                    "content": question,
+                    "model": "router-clarify"
+                }))
+                self.queue.task_done()
+                self._inflight.pop(str(id), None)
+                continue
 
             feats = extract_features(job)
             fh = feature_hash(feats)
 
             duel_cfg = (job.get("routing_hints") or {})
             is_duel = bool(duel_cfg.get("duel") or duel_cfg.get("duel_candidates"))
+            if mode in {"chat", "docs", "planner"}:
+                is_duel = False
+
+            language_hint: str | None = language
+            if mode == "chat":
+                language_hint = None
+            elif mode == "docs":
+                language_hint = "docs"
+            elif mode == "planner":
+                language_hint = "planner"
 
             try:
                 if not is_duel:
-                    base = available_models(language)
+                    base_models = available_models(language_hint)
+                    base = _order_models_for_mode(mode, base_models)
                     async with eng.connect() as conn:
                         ordered = await rank_models(conn, base, fh)
                     m = ordered[0] if ordered else None
@@ -310,18 +594,22 @@ class JobQueue:
                         "status":"done","mode":"single",
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
-                        "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs")
+                        "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
+                        "content": res.get("content"),
+                        "zip_url": res.get("zip_url")
                     })
 
                     await self.hub.publish(str(id), json.dumps({
                         "status":"done",
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
-                        "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs")
+                        "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
+                        "content": res.get("content"),
+                        "zip_url": res.get("zip_url")
                     }))
                 else:
                     cand_names: List[str] = duel_cfg.get("duel_candidates") or []
-                    reg_models = available_models(language)
+                    reg_models = _order_models_for_mode(mode, available_models(language_hint))
                     name_map = { _format_model_name(m): m for m in reg_models }
                     candidates = [name_map[s] for s in cand_names if s in name_map] if cand_names else reg_models[:2]
                     async with eng.connect() as conn:
@@ -342,12 +630,26 @@ class JobQueue:
                             "status":"done","mode":"single",
                             "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                             "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
-                            "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs")
+                            "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
+                            "content": res.get("content"),
+                            "zip_url": res.get("zip_url")
                         })
 
-                        await self.hub.publish(str(id), json.dumps({"status":"done","model":res.get("model"),"latency_ms":res.get("latency_ms"),
-                            "compile_pass":res.get("compile_pass"),"test_pass":res.get("test_pass"),"tool":res.get("tool"),"artifact":res.get("artifact"),"logs":res.get("logs")}))
-                        self.queue.task_done(); self._inflight.pop(str(id), None); continue
+                        await self.hub.publish(str(id), json.dumps({
+                            "status":"done",
+                            "model":res.get("model"),
+                            "latency_ms":res.get("latency_ms"),
+                            "compile_pass":res.get("compile_pass"),
+                            "test_pass":res.get("test_pass"),
+                            "tool":res.get("tool"),
+                            "artifact":res.get("artifact"),
+                            "logs":res.get("logs"),
+                            "content": res.get("content"),
+                            "zip_url": res.get("zip_url")
+                        }))
+                        self.queue.task_done()
+                        self._inflight.pop(str(id), None)
+                        continue
 
                     a_meta, b_meta = ordered[0], ordered[1]
                     a_name, b_name = _format_model_name(a_meta), _format_model_name(b_meta)
@@ -381,12 +683,16 @@ class JobQueue:
                     await self.hub.publish(str(id), json.dumps({
                         "phase":"duel","candidate":a_res["model"],"status":"done",
                         "metrics":{"success":a_res["success"],"latency_ms":a_res["latency_ms"],"compile_pass":a_res["compile_pass"],"test_pass":a_res["test_pass"]},
-                        "tool":a_res["tool"], "artifact":a_res["artifact"], "logs":a_res["logs"]
+                        "tool":a_res["tool"], "artifact":a_res["artifact"], "logs":a_res["logs"],
+                        "content": a_res.get("content"),
+                        "zip_url": a_res.get("zip_url")
                     }))
                     await self.hub.publish(str(id), json.dumps({
                         "phase":"duel","candidate":b_res["model"],"status":"done",
                         "metrics":{"success":b_res["success"],"latency_ms":b_res["latency_ms"],"compile_pass":b_res["compile_pass"],"test_pass":b_res["test_pass"]},
-                        "tool":b_res["tool"], "artifact":b_res["artifact"], "logs":b_res["logs"]
+                        "tool":b_res["tool"], "artifact":b_res["artifact"], "logs":b_res["logs"],
+                        "content": b_res.get("content"),
+                        "zip_url": b_res.get("zip_url")
                     }))
 
                     cfg = get_duel_config()
@@ -434,7 +740,9 @@ class JobQueue:
                         "winner_metrics":{"success":winner["success"], "latency_ms":winner["latency_ms"],
                                           "compile_pass":winner["compile_pass"], "test_pass":winner["test_pass"], "tool":winner["tool"]},
                         "loser_metrics":{"success":loser["success"], "latency_ms":loser["latency_ms"],
-                                         "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]}
+                                         "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]},
+                        "content": winner.get("content"),
+                        "zip_url": winner.get("zip_url")
                     })
 
                     await self.hub.publish(str(id), json.dumps({
@@ -444,7 +752,9 @@ class JobQueue:
                         "winner_metrics":{"success":winner["success"], "latency_ms":winner["latency_ms"],
                                           "compile_pass":winner["compile_pass"], "test_pass":winner["test_pass"], "tool":winner["tool"]},
                         "loser_metrics":{"success":loser["success"], "latency_ms":loser["latency_ms"],
-                                         "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]}
+                                         "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]},
+                        "content": winner.get("content"),
+                        "zip_url": winner.get("zip_url")
                     }))
             except asyncio.CancelledError:
                 # task canceled
@@ -453,10 +763,20 @@ class JobQueue:
                 await self.hub.publish(str(id), json.dumps({"status":"canceled"}))
                 log.info("task.cancelled", {"id": str(id)})
             except Exception as e:
+                err_summary = (str(e) or "").strip()
+                if not err_summary:
+                    err_summary = " ".join(str(x) for x in (getattr(e, "args", []) or []) if x) or e.__class__.__name__
+                trace_txt = "".join(traceback.format_exception(type(e), e, e.__traceback__)).strip()
+                if len(trace_txt) > 6000:
+                    trace_txt = trace_txt[-6000:]
                 async with eng.begin() as conn:
-                    await update_task_status(conn, id, "error", model_used=None)
-                await self.hub.publish(str(id), json.dumps({"status":"error","error":str(e)}))
-                log.error("task.error", {"id": str(id), "err": str(e)})
+                    await update_task_status(conn, id, "error", model_used=None, error=err_summary)
+                await self.hub.publish(str(id), json.dumps({
+                    "status":"error",
+                    "error": err_summary,
+                    "traceback": trace_txt
+                }))
+                log.exception("task.error", {"id": str(id), "error": err_summary})
             finally:
                 self._inflight.pop(str(id), None)
                 self.queue.task_done()

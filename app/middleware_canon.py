@@ -1,135 +1,98 @@
 import json
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
 from starlette.types import ASGIApp, Receive, Scope, Send
-from .status_norm import norm_payload
 
-def _headers_to_dict(raw: List[Tuple[bytes, bytes]]) -> Dict[str, str]:
-    d: Dict[str, str] = {}
-    for k, v in raw:
-        d[k.decode().lower()] = v.decode()
-    return d
+try:
+    from .status_norm import norm_payload
+except Exception:
+    def norm_payload(x): return x
 
-def _dict_to_headers(d: Dict[str, str]) -> List[Tuple[bytes, bytes]]:
-    return [(k.encode(), v.encode()) for k, v in d.items()]
+def _h2d(h: List[Tuple[bytes,bytes]]) -> Dict[str,str]:
+    return {k.decode().lower(): v.decode() for k,v in h}
+def _d2h(d: Dict[str,str]) -> List[Tuple[bytes,bytes]]:
+    return [(k.encode(), v.encode()) for k,v in d.items()]
 
 class JSONCanonicalizerMiddleware:
-    """
-    For application/json responses, buffer the body, canonicalize any 'status' fields,
-    and emit the modified JSON (drops Content-Length to avoid mismatch).
-    """
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
+    def __init__(self, app: ASGIApp) -> None: self.app = app
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        started = {"defer": False, "status": 200, "headers": []}
-        body_chunks: List[bytes] = []
-
-        async def send_wrapper(event):
-            if event["type"] == "http.response.start":
-                headers = event.get("headers", [])
-                hd = _headers_to_dict(headers)
-                ct = hd.get("content-type", "").lower()
-                if "application/json" in ct:
-                    # defer start until we rewrite the body
-                    started["defer"] = True
-                    started["status"] = event["status"]
-                    started["headers"] = headers
-                    return
-                # passthrough for non-JSON
-                await send(event)
-                return
-
-            if event["type"] == "http.response.body" and started["defer"]:
-                body_chunks.append(event.get("body", b""))
-                if event.get("more_body", False):
-                    return  # keep buffering
-                # finalize
-                raw = b"".join(body_chunks)
-                try:
-                    data = json.loads(raw.decode("utf-8"))
-                    data = norm_payload(data)
-                    new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-                except Exception:
-                    new_body = raw  # fall back
-
-                # send start (drop content-length so server can chunk)
-                hd = _headers_to_dict(started["headers"])
-                hd.pop("content-length", None)
-                await send({
-                    "type": "http.response.start",
-                    "status": started["status"],
-                    "headers": _dict_to_headers(hd),
-                })
-                await send({
-                    "type": "http.response.body",
-                    "body": new_body,
-                    "more_body": False,
-                })
-                return
-
-            # default passthrough
-            await send(event)
-
-        await self.app(scope, receive, send_wrapper)
+      if scope.get("type")!="http": return await self.app(scope,receive,send)
+      defer={"on":False,"status":200,"headers":[]}; chunks: List[bytes]=[]
+      async def send_wrapper(ev):
+        if ev["type"]=="http.response.start":
+          hd=_h2d(ev.get("headers",[]))
+          if "application/json" in (hd.get("content-type") or "").lower():
+            defer.update(on=True,status=ev["status"],headers=ev["headers"]); return
+          return await send(ev)
+        if ev["type"]=="http.response.body" and defer["on"]:
+          chunks.append(ev.get("body",b""))
+          if ev.get("more_body"): return
+          raw=b"".join(chunks)
+          try:
+            data=norm_payload(json.loads(raw.decode("utf-8"))); body=json.dumps(data,ensure_ascii=False).encode("utf-8")
+          except Exception:
+            body=raw
+          hd=_h2d(defer["headers"]); hd.pop("content-length",None)
+          await send({"type":"http.response.start","status":defer["status"],"headers":_d2h(hd)})
+          await send({"type":"http.response.body","body":body,"more_body":False}); return
+        return await send(ev)
+      await self.app(scope,receive,send_wrapper)
 
 class SSECanonicalizerMiddleware:
     """
-    For text/event-stream, rewrite each 'data: <json>' line by canonicalizing any 'status'.
-    Streaming-safe: buffers partial lines between chunks.
+    Rewrites 'data: <json>' payloads to canonical and ensures termination.
+    Treats status=='timeout' as terminal -> maps to error+note=timeout, appends [DONE], closes.
+    Set SSE_CANON_MODE=off to bypass.
     """
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
+    def __init__(self, app: ASGIApp) -> None: self.app = app
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
+      if scope.get("type")!="http": return await self.app(scope,receive,send)
+      import os
+      if (os.getenv("SSE_CANON_MODE","on") or "on").lower() in ("off","0","false","disabled"):
+        return await self.app(scope,receive,send)
+      is_sse={"v":False}; buf={"s":""}; closed={"v":False}
+      async def send_wrapper(ev):
+        if closed["v"]: return
+        if ev["type"]=="http.response.start":
+          hd=_h2d(ev.get("headers",[]))
+          is_sse["v"]="text/event-stream" in (hd.get("content-type") or "").lower()
+          if is_sse["v"]:
+            hd.setdefault("cache-control","no-cache"); hd.setdefault("x-accel-buffering","no")
+            e=dict(ev); e["headers"]=_d2h(hd); return await send(e)
+          return await send(ev)
+        if ev["type"]=="http.response.body" and is_sse["v"]:
+          chunk=ev.get("body",b"").decode("utf-8","ignore"); more_up=bool(ev.get("more_body",False))
+          buf["s"]+=chunk
+          parts=buf["s"].split("\n\n"); buf["s"]=parts.pop() if more_up else ""
+          out: List[str]=[]
+          saw_terminal=False; saw_done_marker=False
+          for evtxt in parts:
+            if evtxt.startswith("data:"):
+              payload=evtxt[5:].lstrip()
+              if payload=="[DONE]":
+                out.append("data: [DONE]\n\n"); saw_terminal=True; saw_done_marker=True
+              else:
+                try:
+                  obj=json.loads(payload)
+                  # canonicalize nested fields
+                  obj=norm_payload(obj)
+                  st=str(obj.get("status","")).lower()
+                  if st=="timeout":  # map timeout => error for clients
+                    obj["status"]="error"; obj.setdefault("note","timeout"); saw_terminal=True
+                  if st in ("done","error","canceled") or str(obj.get("note","")).lower()=="artifacts-present":
+                    saw_terminal=True
+                  out.append("data: "+json.dumps(obj,ensure_ascii=False)+"\n\n")
+                except Exception:
+                  out.append(evtxt+"\n\n")
+            else:
+              out.append(evtxt+"\n\n")
+          if saw_terminal:
+            if not saw_done_marker:
+              out.append("data: [DONE]\n\n")
+            data="".join(out).encode("utf-8")
+            await send({"type":"http.response.body","body":data,"more_body":False})
+            closed["v"]=True
             return
-
-        is_sse = {"value": False}
-        buf = {"text": ""}
-
-        async def send_wrapper(event):
-            if event["type"] == "http.response.start":
-                headers = event.get("headers", [])
-                hd = _headers_to_dict(headers)
-                ct = hd.get("content-type", "").lower()
-                is_sse["value"] = "text/event-stream" in ct
-                await send(event)
-                return
-
-            if event["type"] == "http.response.body" and is_sse["value"]:
-                chunk = event.get("body", b"").decode("utf-8", "ignore")
-                more = event.get("more_body", False)
-                buf["text"] += chunk
-
-                out_lines: List[str] = []
-                lines = buf["text"].split("\n")
-                if more:
-                    buf["text"] = lines.pop()  # keep last partial line
-                else:
-                    buf["text"] = ""           # flush all on final
-
-                for line in lines:
-                    if line.startswith("data:"):
-                        payload = line[5:].strip()
-                        if payload and payload != "[DONE]":
-                            try:
-                                obj = json.loads(payload)
-                                obj = norm_payload(obj)
-                                line = "data: " + json.dumps(obj, ensure_ascii=False)
-                            except Exception:
-                                # keep original if not JSON
-                                pass
-                    out_lines.append(line)
-
-                new_body = ("\n".join(out_lines)).encode("utf-8")
-                await send({"type": "http.response.body", "body": new_body, "more_body": more})
-                return
-
-            await send(event)
-
-        await self.app(scope, receive, send_wrapper)
+          data="".join(out).encode("utf-8")
+          return await send({"type":"http.response.body","body":data,"more_body":more_up})
+        return await send(ev)
+      await self.app(scope,receive,send_wrapper)

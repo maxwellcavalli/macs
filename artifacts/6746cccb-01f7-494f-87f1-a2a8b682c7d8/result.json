@@ -1,1 +1,0 @@
-{"status": "done", "mode": "single", "model": "llama3.1:8b", "latency_ms": 21277, "compile_pass": true, "test_pass": true, "tool": "maven-scaffolded", "artifact": "/app/workspace/.duel/6746cccb-01f7-494f-87f1-a2a8b682c7d8/llama3.1_8b/src/main/java/com/acme/Smoke.java", "logs": {"build_stdout_tail": "", "build_stderr_tail": ""}}

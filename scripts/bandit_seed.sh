@@ -17,9 +17,11 @@ post() {
 }
 
 # Sample data
-post '{"model_id":"llama3.1:8b-q4","task_type":"duel","reward":0.80,"won":true}'
-post '{"model_id":"qwen2.5-coder","task_type":"duel","reward":0.60,"won":false}'
-post '{"model_id":"force-model","task_type":"duel","reward":0.754,"won":true}'
+post '{"model_id":"mistral:7b-instruct-q4_K_M","task_type":"router","reward":0.70,"won":true}'
+post '{"model_id":"qwen2.5-coder:7b-instruct-q4_K_M","task_type":"code","reward":0.90,"won":true}'
+post '{"model_id":"gemma2:9b-instruct-q4_K_M","task_type":"docs","reward":0.85,"won":true}'
+post '{"model_id":"deepseek-coder:6.7b-instruct-q4_K_M","task_type":"planner","reward":0.75,"won":true}'
+post '{"model_id":"gemma2:9b-instruct-q4_K_M","task_type":"duel","reward":0.65,"won":false}'
 
 echo "Current aggregated stats:"
 curl -s "$API/v1/bandit/stats" | jq . || true

@@ -50,10 +50,21 @@ services:
         protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: volume
-        source: artifacts
+      - type: bind
+        source: ./artifacts
         target: /data/artifacts
-        volume: {}
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./workspace/zips
+        target: /data/zips
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./workspace/zips
+        target: /data/zips
+        bind:
+          create_host_path: true
   flyway:
     command:
       - -url=jdbc:postgresql://postgres:5432/agent
@@ -147,6 +158,7 @@ services:
               count: -1
     environment:
       OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_DEBUG: "1"
     gpus:
       - count: -1
     healthcheck:
@@ -159,12 +171,19 @@ services:
     image: ollama/ollama:latest
     networks:
       default: null
+    ports:
+      - mode: ingress
+        host_ip: 127.0.0.1
+        target: 11434
+        published: "11434"
+        protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: volume
-        source: ollama_models
+      - type: bind
+        source: ./ollama/models
         target: /root/.ollama
-        volume: {}
+        bind:
+          create_host_path: true
   postgres:
     environment:
       POSTGRES_DB: macs
@@ -272,6 +291,12 @@ services:
     networks:
       default: null
     restart: unless-stopped
+    volumes:
+      - type: bind
+        source: ./workspace/zips
+        target: /data/zips
+        bind:
+          create_host_path: true
   worker:
     build:
       context: /mnt/d/agente/multi_agent_code_system_v24
@@ -299,14 +324,10 @@ networks:
   default:
     name: macs_default
 volumes:
-  artifacts:
-    name: macs_artifacts
   grafana_data:
     name: macs_grafana_data
   grafana_provisioning:
     name: macs_grafana_provisioning
-  ollama_models:
-    name: macs_ollama_models
   pgdata:
     name: macs_pgdata
   promconfig:
