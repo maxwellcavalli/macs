@@ -58,19 +58,44 @@
     </header>
 
     <main class="flex-1 py-6">
-      <section class="max-w-5xl mx-auto px-4 flex flex-col gap-4 h-full">
-        <div class="flex-1 rounded-3xl border border-slate-800 bg-slate-900/60 backdrop-blur flex flex-col overflow-hidden">
-          <div id="messages" class="chat-scroll flex-1 overflow-y-auto px-6 py-6 space-y-4">
-            <div class="text-center text-sm text-slate-500">No messages yet. Say hi!</div>
+      <section class="max-w-6xl mx-auto px-4">
+        <div class="grid gap-6 lg:grid-cols-[2fr,1fr] h-full">
+          <div class="flex flex-col gap-4 h-full">
+            <div class="flex-1 rounded-3xl border border-slate-800 bg-slate-900/60 backdrop-blur flex flex-col overflow-hidden">
+              <div id="messages" class="chat-scroll flex-1 overflow-y-auto px-6 py-6 space-y-4">
+                <div class="text-center text-sm text-slate-500">No messages yet. Say hi!</div>
+              </div>
+              <div class="border-t border-slate-800 bg-slate-900/80 px-4 py-3 flex flex-wrap items-center gap-3">
+                <button type="button" id="memoryRefreshBtn" class="rounded-2xl border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 transition">Find related work</button>
+                <span id="memoryStatus" class="text-[0.75rem] text-slate-400 hidden"></span>
+              </div>
+              <form id="composer" class="border-t border-slate-800 bg-slate-900/80 px-4 py-4 flex gap-3 items-end">
+                <textarea id="messageInput" class="flex-1 min-h-[72px] max-h-52 resize-y rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-100 focus:outline-none focus:ring focus:ring-indigo-500/40" placeholder="Type your message..."></textarea>
+                <button type="submit" id="sendBtn" class="rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50">Send</button>
+              </form>
+            </div>
+            <aside class="text-xs text-slate-400">
+              <p><span class="text-slate-200 font-medium">Tips:</span> chat requests are routed to conversational models. When the router is unsure, it will ask whether you want code or plain language.</p>
+            </aside>
           </div>
-          <form id="composer" class="border-t border-slate-800 bg-slate-900/80 px-4 py-4 flex gap-3 items-end">
-            <textarea id="messageInput" class="flex-1 min-h-[72px] max-h-52 resize-y rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-100 focus:outline-none focus:ring focus:ring-indigo-500/40" placeholder="Type your message..."></textarea>
-            <button type="submit" id="sendBtn" class="rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50">Send</button>
-          </form>
+          <aside id="memoryPanel" class="rounded-3xl border border-slate-800 bg-slate-900/60 backdrop-blur flex flex-col overflow-hidden">
+            <header class="border-b border-slate-800 px-4 py-3 space-y-2">
+              <div class="flex items-center justify-between gap-2">
+                <div>
+                  <h2 class="text-sm font-semibold text-slate-200">Workspace memory</h2>
+                  <p class="text-xs text-slate-400 mt-1">Select up to three past completions to ground the next reply.</p>
+                </div>
+                <div class="flex items-center gap-2">
+                  <button type="button" id="memoryUploadBtn" class="rounded-xl border border-slate-700 bg-slate-900 px-3 py-1.5 text-[0.7rem] font-medium text-slate-200 hover:bg-slate-800 transition">Attach code</button>
+                  <input id="memoryUploadInput" type="file" accept=".zip" class="hidden" />
+                </div>
+              </div>
+            </header>
+            <div id="memoryList" class="chat-scroll flex-1 overflow-y-auto px-4 py-4 space-y-3 text-sm text-slate-300">
+              <p class="text-sm text-slate-500">No related history yet. Click “Find related work” to search.</p>
+            </div>
+          </aside>
         </div>
-        <aside class="text-xs text-slate-400">
-          <p><span class="text-slate-200 font-medium">Tips:</span> chat requests are routed to conversational models. When the router is unsure, it will ask whether you want code or plain language.</p>
-        </aside>
       </section>
     </main>
   </div>
@@ -87,11 +112,22 @@
       }
     });
 
+    const SESSION_KEY = "chat.sessionId";
     const state = {
       base: localStorage.getItem("chat.apiBase") || window.location.origin.replace(/\/chat\/?$/, ""),
       key: localStorage.getItem("chat.apiKey") || "",
+      repoPath: localStorage.getItem("chat.repoPath") || "./workspace",
       sending: false,
       eventSource: null,
+      sessionId: sessionStorage.getItem(SESSION_KEY) || "",
+    };
+
+    const memoryState = {
+      results: [],
+      selected: new Set(),
+      loading: false,
+      error: null,
+      manualSelection: false,
     };
 
     const messagesEl = document.getElementById("messages");
@@ -104,6 +140,14 @@
 
     const conversation = [];
 
+    const memoryListEl = document.getElementById("memoryList");
+    const memoryStatusEl = document.getElementById("memoryStatus");
+    const memoryRefreshBtn = document.getElementById("memoryRefreshBtn");
+    const memoryUploadBtn = document.getElementById("memoryUploadBtn");
+    const memoryUploadInput = document.getElementById("memoryUploadInput");
+
+    const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+
     function applyStateToInputs() {
       apiBaseEl.value = state.base;
       apiKeyEl.value = state.key;
@@ -112,6 +156,7 @@
     function rememberSettings() {
       localStorage.setItem("chat.apiBase", state.base);
       localStorage.setItem("chat.apiKey", state.key);
+      localStorage.setItem("chat.repoPath", state.repoPath);
     }
 
     function clearConversation() {
@@ -121,10 +166,285 @@
       ghost.className = "text-center text-sm text-slate-500";
       ghost.textContent = "Conversation cleared.";
       messagesEl.appendChild(ghost);
+      memoryState.selected.clear();
+      memoryState.results = [];
+      memoryState.manualSelection = false;
+      updateMemoryPanel();
     }
 
     function scrollMessages() {
       messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    const SUPPORTED_LANGUAGES = ["java", "python", "graphql"];
+
+    function ensureSessionId() {
+      if (state.sessionId) return state.sessionId;
+      if (window.crypto && crypto.randomUUID) {
+        state.sessionId = crypto.randomUUID();
+      } else {
+        state.sessionId = `sess-${Math.random().toString(16).slice(2, 10)}`;
+      }
+      sessionStorage.setItem(SESSION_KEY, state.sessionId);
+      return state.sessionId;
+    }
+
+    function truncate(text, max) {
+      if (!text) return "";
+      if (text.length <= max) return text;
+      return text.slice(0, max - 1) + "…";
+    }
+
+    function inferLanguage(message) {
+      // Prefer selected memory languages
+      for (const item of memoryState.results) {
+        if (memoryState.selected.has(item.id) && item.language) {
+          const lang = String(item.language).toLowerCase();
+          if (SUPPORTED_LANGUAGES.includes(lang)) {
+            return lang;
+          }
+        }
+      }
+      const text = (message || "").toLowerCase();
+      if (text.includes("graphql")) return "graphql";
+      if (text.includes("java")) return "java";
+      if (text.includes("python")) return "python";
+      return "python";
+    }
+
+    function normalizeRepoPath(value) {
+      if (!value) return "./workspace";
+      let s = String(value).trim().replace(/\\/g, "/");
+      if (!s) return "./workspace";
+      s = s.replace(/^\.\/+/, "");
+      if (s.startsWith("workspace/")) s = s.slice("workspace/".length);
+      if (s.startsWith("./workspace/")) s = s.slice("./workspace/".length);
+      if (s === "workspace") s = "";
+      if (s.startsWith("./")) s = s.slice(2);
+      s = s.replace(/^\/+/, "");
+      s = s.replace(/\/+$/, "");
+      if (!s || s === ".") return "./workspace";
+      return `./workspace/${s}`;
+    }
+
+    function setRepoPath(value) {
+      const normalized = normalizeRepoPath(value);
+      state.repoPath = normalized;
+      localStorage.setItem("chat.repoPath", normalized);
+    }
+
+    function updateMemoryPanel() {
+      const resultIds = new Set(memoryState.results.map(r => r.id));
+      Array.from(memoryState.selected).forEach(id => {
+        if (!resultIds.has(id)) {
+          memoryState.selected.delete(id);
+        }
+      });
+
+      if (memoryState.loading) {
+        memoryStatusEl.textContent = "Searching workspace memories…";
+        memoryStatusEl.classList.remove("hidden");
+      } else if (memoryState.error) {
+        memoryStatusEl.textContent = memoryState.error;
+        memoryStatusEl.classList.remove("hidden");
+      } else {
+        memoryStatusEl.classList.add("hidden");
+      }
+
+      if (!memoryState.results.length) {
+        memoryListEl.innerHTML = '<p class="text-sm text-slate-500">No related history yet. Click “Find related work” to search.</p>';
+        return;
+      }
+
+      const frag = document.createDocumentFragment();
+      memoryState.results.forEach((item) => {
+        const card = document.createElement("button");
+        const isSelected = memoryState.selected.has(item.id);
+        card.type = "button";
+        card.dataset.id = item.id;
+        card.className = [
+          "w-full text-left rounded-2xl border px-3 py-3 transition",
+          isSelected
+            ? "border-indigo-400 bg-indigo-500/20 text-indigo-100"
+            : "border-slate-700 bg-slate-950/40 text-slate-200 hover:border-indigo-400/40 hover:bg-indigo-500/10"
+        ].join(" ");
+
+        const title = document.createElement("div");
+        title.className = "text-xs font-semibold uppercase tracking-[0.2em] text-slate-400 mb-1";
+        title.textContent = item.goal ? truncate(item.goal, 120) : "Workspace memory";
+
+        const summary = document.createElement("p");
+        summary.className = "text-xs leading-relaxed whitespace-pre-wrap";
+        summary.textContent = truncate(item.summary || "(no summary)", 260);
+
+        const meta = document.createElement("div");
+        meta.className = "mt-2 text-[0.65rem] uppercase tracking-[0.2em] text-slate-500 flex gap-2";
+        if (item.model) {
+          const badge = document.createElement("span");
+          badge.textContent = item.model;
+          meta.appendChild(badge);
+        }
+        if (item.created_at) {
+          const date = new Date(item.created_at);
+          if (!isNaN(date)) {
+            const badge = document.createElement("span");
+            badge.textContent = date.toLocaleString();
+            meta.appendChild(badge);
+          }
+        }
+
+        card.appendChild(title);
+        card.appendChild(summary);
+        if (meta.childElementCount) {
+          card.appendChild(meta);
+        }
+        frag.appendChild(card);
+      });
+      memoryListEl.innerHTML = "";
+      memoryListEl.appendChild(frag);
+    }
+
+    async function fetchMemories(queryText) {
+      if (!state.base) {
+        memoryState.error = "Set API Base to search.";
+        updateMemoryPanel();
+        return;
+      }
+      memoryState.loading = true;
+      memoryState.error = null;
+      updateMemoryPanel();
+      try {
+        const trimmed = (queryText || "").trim();
+        const headers = state.key ? { "x-api-key": state.key } : {};
+        const sessionId = ensureSessionId();
+
+        const sessionParams = new URLSearchParams({ limit: "5", session_id: sessionId });
+        if (trimmed) sessionParams.set("query", trimmed.slice(0, 200));
+        const globalParams = new URLSearchParams({ limit: "5" });
+        if (trimmed) globalParams.set("query", trimmed.slice(0, 200));
+
+        const base = state.base.replace(/\/$/, "");
+        const [sessionResp, globalResp] = await Promise.all([
+          fetch(`${base}/v1/memory/search?${sessionParams.toString()}`, { headers }),
+          fetch(`${base}/v1/memory/search?${globalParams.toString()}`, { headers }),
+        ]);
+
+        if (!sessionResp.ok) throw new Error(`session HTTP ${sessionResp.status}`);
+        if (!globalResp.ok) throw new Error(`global HTTP ${globalResp.status}`);
+
+        const sessionData = await sessionResp.json();
+        const globalData = await globalResp.json();
+        const combined = [...(sessionData.memories || []), ...(globalData.memories || [])];
+
+        const dedup = new Map();
+        combined.forEach(item => {
+          if (item && item.id) {
+            if (!dedup.has(item.id)) {
+              dedup.set(item.id, item);
+            }
+          }
+        });
+
+        const uniqueResults = Array.from(dedup.values());
+        const sessionScoped = uniqueResults.filter(item => item && item.session_id && item.session_id === state.sessionId);
+        const nextResults = sessionScoped.length ? sessionScoped : uniqueResults;
+        memoryState.results = nextResults;
+        if (!memoryState.manualSelection) {
+          memoryState.selected = new Set(
+            nextResults
+              .filter(item => item && item.id)
+              .map(item => item.id)
+          );
+        }
+        const repoCandidate = nextResults.find(item => item && item.repo_path)?.repo_path;
+        if (repoCandidate) {
+          setRepoPath(repoCandidate);
+        }
+      } catch (err) {
+        console.error("memory search failed", err);
+        memoryState.error = `Search failed: ${err.message || err}`;
+        memoryState.results = [];
+      } finally {
+        memoryState.loading = false;
+        updateMemoryPanel();
+      }
+    }
+
+    function toggleMemorySelection(id) {
+      if (!id) return;
+      if (memoryState.selected.has(id)) {
+        memoryState.selected.delete(id);
+        memoryState.manualSelection = true;
+        updateMemoryPanel();
+        return;
+      }
+      memoryState.selected.add(id);
+      memoryState.error = null;
+      memoryState.manualSelection = true;
+      updateMemoryPanel();
+    }
+
+    async function uploadMemoryArchive(file) {
+      if (!file) return;
+      if (!state.base) {
+        memoryState.error = "Set API Base first.";
+        updateMemoryPanel();
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        memoryState.error = "Archive too large (max 10MB).";
+        updateMemoryPanel();
+        return;
+      }
+      const form = new FormData();
+      form.append("file", file, file.name);
+      form.append("session_id", ensureSessionId());
+      const headers = state.key ? { "x-api-key": state.key } : {};
+      memoryState.loading = true;
+      memoryState.error = null;
+      updateMemoryPanel();
+      try {
+        const resp = await fetch(`${state.base.replace(/\/$/, "")}/v1/memory/upload`, {
+          method: "POST",
+          headers,
+          body: form,
+        });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(detail || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        if (data.session_id && data.session_id !== state.sessionId) {
+          state.sessionId = data.session_id;
+          sessionStorage.setItem(SESSION_KEY, state.sessionId);
+        }
+        if (data.workspace_path) {
+          setRepoPath(data.workspace_path);
+        } else if (data.repo_path) {
+          setRepoPath(data.repo_path);
+        }
+        const incoming = Array.isArray(data.memories) ? data.memories : [];
+        incoming.forEach(item => {
+          if (item && item.id) {
+            memoryState.selected.add(item.id);
+          }
+        });
+        // Deduplicate combined results
+        const existing = new Map(memoryState.results.map(item => [item.id, item]));
+        incoming.forEach(item => {
+          if (item && item.id) {
+            existing.set(item.id, item);
+          }
+        });
+        memoryState.results = Array.from(existing.values());
+        await fetchMemories("");
+      } catch (err) {
+        console.error("upload failed", err);
+        memoryState.error = `Upload failed: ${err.message || err}`;
+      } finally {
+        memoryState.loading = false;
+        updateMemoryPanel();
+      }
     }
 
     function decorateCodeBlocks(root) {
@@ -215,18 +535,23 @@
     }
 
     function toTaskPayload(message) {
+      const language = inferLanguage(message);
+      const sessionId = ensureSessionId();
+      const repoPath = state.repoPath || "./workspace";
       return {
         type: "DOC",
         input: {
-          language: "python",
+          language,
           frameworks: [],
-          repo: { path: "./workspace", include: [], exclude: [] },
+          repo: { path: repoPath, include: [], exclude: [] },
           constraints: { max_tokens: 1024, latency_ms: 60000 },
           goal: message,
         },
         metadata: {
           mode_hint: "chat",
           conversation: conversation,
+          memory_context_ids: Array.from(memoryState.selected),
+          session_id: sessionId,
         },
         output_contract: { expected_files: [] },
       };
@@ -256,10 +581,26 @@
       const es = new EventSource(endpoint);
       state.eventSource = es;
      const handleDone = (payload) => {
-        let text = payload.content || payload.message || payload.result || "";
-        if (!text) {
-          text = "Done (no content returned).";
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
         }
+
+        if (payload && payload.pending_final) {
+          pendingBubble.body.textContent = "Still working… retrieving final result.";
+          fetchFinalResult(taskId, pendingBubble);
+          return;
+        }
+
+        const text = payload.content || payload.message || payload.result || "";
+        const hasImmediateContent = Boolean(text && text.trim().length);
+
+        if (!hasImmediateContent) {
+          pendingBubble.body.textContent = "Still working… retrieving final result.";
+          fetchFinalResult(taskId, pendingBubble);
+          return;
+        }
+
         renderMarkdown(pendingBubble.body, text);
         conversation.push({ role: "assistant", content: text });
         if (payload.zip_url) {
@@ -272,8 +613,6 @@
           pendingBubble.body.appendChild(link);
         }
         disableComposer(false);
-        es.close();
-        state.eventSource = null;
       };
 
       es.addEventListener("done", evt => {
@@ -298,14 +637,18 @@
           } else if (payload.status === "error") {
             pendingBubble.body.textContent = `Error: ${payload.error || "unknown"}`;
             disableComposer(false);
-            es.close();
-            state.eventSource = null;
+            if (state.eventSource) {
+              state.eventSource.close();
+              state.eventSource = null;
+            }
           } else if (payload.mode === "clarify" && payload.content) {
             renderMarkdown(pendingBubble.body, payload.content);
             conversation.push({ role: "assistant", content: payload.content });
             disableComposer(false);
-            es.close();
-            state.eventSource = null;
+            if (state.eventSource) {
+              state.eventSource.close();
+              state.eventSource = null;
+            }
           }
         } catch (err) {
           console.error("Failed to parse SSE message", err);
@@ -313,8 +656,10 @@
       };
       es.onerror = () => {
         pendingBubble.body.textContent = "Still thinking… collecting the final answer for you.";
-        es.close();
-        state.eventSource = null;
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
         fetchFinalResult(taskId, pendingBubble);
       };
     }
@@ -401,19 +746,46 @@
       state.key = apiKeyEl.value.trim();
       rememberSettings();
     });
-    newChatBtn.addEventListener("click", () => {
-      if (state.eventSource) {
-        state.eventSource.close();
-        state.eventSource = null;
-      }
+    memoryRefreshBtn.addEventListener("click", () => {
+      fetchMemories(inputEl.value || (conversation[conversation.length - 1]?.content ?? ""));
+    });
+    memoryListEl.addEventListener("click", (event) => {
+      const target = event.target.closest("button[data-id]");
+      if (!target) return;
+      toggleMemorySelection(target.dataset.id);
+    });
+    memoryUploadBtn.addEventListener("click", () => {
+      memoryUploadInput.value = "";
+      memoryUploadInput.click();
+    });
+    memoryUploadInput.addEventListener("change", async (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      await uploadMemoryArchive(file);
+    });
+      newChatBtn.addEventListener("click", () => {
+        if (state.eventSource) {
+          state.eventSource.close();
+          state.eventSource = null;
+        }
       clearConversation();
       disableComposer(false);
       inputEl.focus();
+        memoryState.selected.clear();
+        memoryState.results = [];
+        memoryState.manualSelection = false;
+      state.sessionId = "";
+      sessionStorage.removeItem(SESSION_KEY);
+      ensureSessionId();
+      sessionStorage.setItem(SESSION_KEY, state.sessionId);
+      updateMemoryPanel();
     });
     composerForm.addEventListener("submit", sendMessage);
 
     applyStateToInputs();
+    ensureSessionId();
     inputEl.focus();
+    updateMemoryPanel();
   </script>
 </body>
 </html>

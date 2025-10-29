@@ -22,6 +22,14 @@ down:          ## Stop stack
 build:         ## Rebuild API image
 > $(COMPOSE) build api
 
+.PHONY: up-api
+up-api:        ## Build and start API service only
+> $(COMPOSE) up -d --build api
+
+.PHONY: restart-all
+restart-all:   ## Rebuild and restart all compose services
+> $(COMPOSE) up -d --build
+
 restart:       ## Restart API service
 > $(COMPOSE) restart api
 
@@ -142,23 +150,16 @@ ci-local:      ## Run integration smoke test locally
 
 
 # ---- Database (Flyway) ----
-db-info:
-> ./scripts/flyway.sh info
+.PHONY: flyway-repair flyway-migrate
+flyway-repair: ## Repair Flyway schema history via docker compose
+> ./scripts/flyway_repair.sh
 
-db-migrate:
-> ./scripts/flyway.sh migrate
+flyway-migrate: ## Run Flyway migrations via docker compose
+> ./scripts/flyway_migrate.sh
 
-db-baseline-0:
-> ./scripts/flyway.sh baseline -baselineVersion=0
-
-db-validate:
-> ./scripts/flyway.sh validate
-
-db-repair:
-> ./scripts/flyway.sh repair
-
-db-clean:
-> ./scripts/flyway.sh clean
+.PHONY: memory-ingest
+memory-ingest: ## Bootstrap existing repo files into workspace memory
+> ./tools/memory_ingest_repo.py --root ./workspace
 
 bandit-seed: ## Replay earlier bandit totals into the DB
 > ./scripts/bandit_seed.sh

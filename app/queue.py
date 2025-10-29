@@ -1,8 +1,9 @@
 from __future__ import annotations
 from .bandit_client import record as bandit_record
 import asyncio, time, json, textwrap, os, re, traceback
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
+from fnmatch import fnmatch
 from .sse import StreamHub
 from .registry import available_models
 from .db import get_engine, update_task_status
@@ -18,11 +19,15 @@ from .exec_sandbox import run_sandboxed
 from .build_java import build_and_test_java
 from .logging_setup import get_logger
 from .logctx import set_task_id, set_candidate
+from .fs_sandbox import resolve_safe_path, WORKSPACE_ROOT
+from .java_utils import fix_java_package, fix_java_filename
+from .workspace_io import ensure_merge_tree
 
 # additions
 from .bandit_store import record_event as bandit_record_event
 from .artifacts import write_result
 from .zips import write_zip
+from .memory import record_completion
 
 log = get_logger("queue")
 
@@ -63,8 +68,59 @@ MODE_PREFERENCES = {
     ],
 }
 
+COMPONENT_SYNONYMS = {
+    "repository": ("repository", "repositories", "repo interface", "data access object", "dao"),
+    "service": ("service", "services", "application service"),
+    "controller": ("controller", "controllers", "rest controller", "rest controllers", "api controller"),
+    "entity": ("entity", "entities", "domain entity"),
+    "dto": ("dto", "dtos", "data transfer object", "data transfer objects"),
+}
+
+COMPONENT_PLACEMENT = {
+    "repository": {"folder": "repository", "keywords": ("repository", "repositories", "repo", "dao")},
+    "service": {"folder": "service", "keywords": ("service", "services")},
+    "controller": {"folder": "controller", "keywords": ("controller", "controllers")},
+    "entity": {"folder": "entity", "keywords": ("entity", "entities", "model")},
+    "dto": {"folder": "dto", "keywords": ("dto", "dtos")},
+}
+
+COMPONENT_ANNOTATIONS = {
+    "repository": ("@repository", "@jdbcrepository"),
+    "service": ("@service",),
+    "controller": ("@restcontroller", "@controller"),
+    "entity": ("@entity", "@table"),
+    "dto": ("@value", "@data"),
+}
+
+COMPONENT_CLASS_HINTS = {
+    "repository": ("repository", "dao"),
+    "service": ("service",),
+    "controller": ("controller", "resource"),
+    "entity": ("entity", "model"),
+    "dto": ("dto",),
+}
+
 CANDIDATE_TIMEOUT_SEC = int(os.getenv("CANDIDATE_TIMEOUT_SEC", "180"))
 DUEL_TIMEOUT_SEC = int(os.getenv("DUEL_TIMEOUT_SEC", "120"))
+FORCE_DUEL = (os.getenv("FORCE_DUEL", "0") or "0").lower() in ("1", "true", "yes")
+
+ZIP_INCLUDE_REPO = (os.getenv("ZIP_INCLUDE_REPO", "1") or "1").lower() not in ("0", "false", "no", "")
+ZIP_MAX_FILES = int(os.getenv("ZIP_MAX_FILES", "400"))
+ZIP_MAX_BYTES = int(os.getenv("ZIP_MAX_BYTES", str(10 * 1024 * 1024)))
+ZIP_MAX_FILE_BYTES = int(os.getenv("ZIP_MAX_FILE_BYTES", str(512 * 1024)))
+ZIP_REPO_PREFIX = (os.getenv("ZIP_REPO_PREFIX", "") or "").strip()
+ZIP_SKIP_SEGMENTS = tuple(
+    seg.strip() for seg in (os.getenv(
+        "ZIP_SKIP_SEGMENTS",
+        ".git,.hg,.svn,.idea,.vscode,.gradle,.mvn,node_modules,dist,build,target,.pytest_cache,.ruff_cache,.tox,coverage,zips,.duel"
+    ).split(",")) if seg.strip()
+)
+ZIP_SKIP_SUFFIXES = tuple(
+    suf.strip() for suf in (os.getenv(
+        "ZIP_SKIP_SUFFIXES",
+        ".class,.jar,.war,.ear,.zip,.tar,.gz,.tgz,.xz,.png,.jpg,.jpeg,.gif,.bmp,.ico,.exe,.dll,.so,.dylib,.bin,.lock,.log"
+    ).split(",")) if suf.strip()
+)
 
 CODE_BLOCK_RE = re.compile(r"```([\w.+-]*)\n([\s\S]*?)```", re.MULTILINE)
 PATH_HINT_RE = re.compile(r"(?:^|\b)(?:file|path)\s*[:=]\s*([\w./\\-]+)", re.IGNORECASE)
@@ -86,6 +142,8 @@ def _extract_files_from_content(text: str) -> Dict[str, str]:
             lines.pop(0)
         if lines:
             first = lines[0].strip()
+            first = first.lstrip("*_`> ")
+            first = first.replace("**", "").replace("`", "")
             m = PATH_HINT_RE.match(first)
             if m:
                 path = _sanitize_rel_path(m.group(1))
@@ -93,7 +151,9 @@ def _extract_files_from_content(text: str) -> Dict[str, str]:
         if not path:
             context = text[:match.start()].splitlines()
             for line in reversed(context[-4:]):
-                m = PATH_HINT_RE.search(line)
+                line_clean = line.strip().lstrip("*_`> ")
+                line_clean = line_clean.replace("**", "").replace("`", "")
+                m = PATH_HINT_RE.search(line_clean)
                 if m:
                     path = _sanitize_rel_path(m.group(1))
                     break
@@ -124,6 +184,158 @@ def _order_models_for_mode(mode: str, models: List[Dict[str, Any]]) -> List[Dict
         tag = _format_model_name(m)
         return (index.get(tag, len(prefs)), int(m.get("speed_rank", 999)))
     return sorted(models, key=sort_key)
+
+def _normalize_repo_rel(path: str) -> str:
+    cleaned = str(path or "").strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    if cleaned.startswith("/"):
+        cleaned = cleaned.lstrip("/")
+    workspace_name = WORKSPACE_ROOT.name
+    if cleaned == workspace_name:
+        cleaned = ""
+    elif cleaned.startswith(f"{workspace_name}/"):
+        cleaned = cleaned[len(workspace_name)+1:]
+    if not cleaned or cleaned == ".":
+        return "."
+    return cleaned
+
+def _should_skip_repo_file(rel_posix: str, includes: List[str], excludes: List[str]) -> bool:
+    rel_norm = rel_posix.replace("\\", "/")
+    parts = [p for p in rel_norm.split("/") if p]
+    if any(part in ZIP_SKIP_SEGMENTS for part in parts):
+        return True
+    if any(rel_norm.endswith(suf) for suf in ZIP_SKIP_SUFFIXES):
+        return True
+    if includes:
+        if not any(fnmatch(rel_norm, pat) for pat in includes):
+            return True
+    if excludes and any(fnmatch(rel_norm, pat) for pat in excludes):
+        return True
+    return False
+
+def _read_text_file(path: Path) -> str | None:
+    try:
+        size = path.stat().st_size
+        if ZIP_MAX_FILE_BYTES and size > ZIP_MAX_FILE_BYTES:
+            return None
+    except Exception:
+        pass
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return path.read_text(encoding="latin-1")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+def _collect_repo_snapshot(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
+    notes: List[str] = []
+    if not ZIP_INCLUDE_REPO:
+        return {}, notes
+    repo = (job.get("input") or {}).get("repo") or {}
+    repo_path_raw = repo.get("path")
+    defaulted_path = False
+    if not repo_path_raw:
+        repo_path_raw = "."
+        defaulted_path = True
+    rel = _normalize_repo_rel(repo_path_raw)
+    repo_dir, ok = resolve_safe_path(rel if rel != "." else ".")
+    if not ok or not repo_dir.exists():
+        notes.append(f"Repo snapshot skipped (path '{rel}' not accessible).")
+        return {}, notes
+    includes = [str(p).strip() for p in (repo.get("include") or []) if str(p).strip()]
+    excludes = [str(p).strip() for p in (repo.get("exclude") or []) if str(p).strip()]
+    base_parts: List[str] = []
+    if ZIP_REPO_PREFIX:
+        base_parts.append(ZIP_REPO_PREFIX)
+    if rel not in (".", ""):
+        base_parts.append(rel)
+    base_prefix = "/".join(p.strip("/") for p in base_parts if p)
+    collected: Dict[str, str] = {}
+    total_bytes = 0
+    file_count = 0
+    try:
+        for fs_path in sorted(repo_dir.rglob("*")):
+            if not fs_path.is_file():
+                continue
+            rel_path = fs_path.relative_to(repo_dir).as_posix()
+            if _should_skip_repo_file(rel_path, includes, excludes):
+                continue
+            text = _read_text_file(fs_path)
+            if text is None:
+                continue
+            encoded = text.encode("utf-8", errors="ignore")
+            size = len(encoded)
+            if file_count >= ZIP_MAX_FILES or (ZIP_MAX_BYTES and total_bytes + size > ZIP_MAX_BYTES):
+                notes.append(
+                    f"Repo snapshot truncated at {file_count} files / {total_bytes} bytes "
+                    f"(limits: {ZIP_MAX_FILES} files, {ZIP_MAX_BYTES} bytes)."
+                )
+                break
+            if base_prefix:
+                rel_key = f"{base_prefix}/{rel_path}" if rel_path else base_prefix
+            else:
+                rel_key = rel_path
+            if not rel_key:
+                continue
+            collected[rel_key] = text
+            total_bytes += size
+            file_count += 1
+    except Exception as exc:
+        notes.append(f"Repo snapshot error: {exc}")
+    if collected:
+        if not notes:
+            notes.append(f"Repo snapshot captured {file_count} files ({total_bytes} bytes).")
+        if defaulted_path:
+            notes.append("Repo snapshot defaulted to workspace root (no repo.path provided).")
+    return collected, notes
+
+def _collect_memory_context_files(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
+    files: Dict[str, str] = {}
+    notes: List[str] = []
+    meta = job.get("metadata") or {}
+    entries = meta.get("memory_context") or []
+    if not isinstance(entries, list) or not entries:
+        return files, notes
+    for idx, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        mem_id = str(entry.get("id") or idx)
+        base = f"memory/{idx:02d}_{mem_id}"
+        summary = str(entry.get("summary") or "").strip()
+        if summary:
+            files.setdefault(f"{base}/SUMMARY.txt", summary if summary.endswith("\n") else summary + "\n")
+        payload = entry.get("files")
+        if not isinstance(payload, dict):
+            notes.append(f"Memory {mem_id}: no file payload available.")
+            continue
+        file_map = payload.get("files") if isinstance(payload.get("files"), dict) else {}
+        wrote_any = False
+        if isinstance(file_map, dict):
+            for rel, content in file_map.items():
+                rel_sanitized = _sanitize_rel_path(str(rel)) or "memory.txt"
+                body = str(content or "")
+                if not body.endswith("\n"):
+                    body += "\n"
+                files.setdefault(f"{base}/files/{rel_sanitized}", body)
+                wrote_any = True
+        artifact_preview = payload.get("artifact_preview")
+        artifact_rel = payload.get("artifact")
+        if artifact_preview:
+            rel_sanitized = _sanitize_rel_path(str(artifact_rel or "artifact.txt"))
+            body = str(artifact_preview)
+            if not body.endswith("\n"):
+                body += "\n"
+            files.setdefault(f"{base}/artifact/{rel_sanitized}", body)
+            wrote_any = True
+        if not wrote_any:
+            notes.append(f"Memory {mem_id}: no readable files captured (may exceed limits or be binary).")
+    if files and not notes:
+        notes.append("Memory context files included in zip (truncated previews).")
+    return files, notes
 
 def _infer_mode(job: Dict[str, Any]) -> str:
     meta = job.get("metadata") or {}
@@ -190,6 +402,384 @@ def _derive_java_pkg_class(rel_path: str) -> Tuple[str, str]:
         pkg = ".".join(p for p in pkg_parts if p not in ("src","main"))
         return pkg, cls
 
+def _detect_requested_components(goal: str) -> List[str]:
+    goal_l = goal.lower()
+    found: List[str] = []
+    for label, variants in COMPONENT_SYNONYMS.items():
+        if any(v in goal_l for v in variants):
+            found.append(label)
+    seen = set()
+    ordered: List[str] = []
+    for label in found:
+        if label in seen:
+            continue
+        seen.add(label)
+        ordered.append(label)
+    return ordered
+
+def _collect_repo_include_hints(job: Dict[str, Any], limit: int = 4) -> List[str]:
+    repo = (job.get("input") or {}).get("repo") or {}
+    includes = repo.get("include") or []
+    hints: List[str] = []
+    for raw in includes:
+        path = str(raw).strip()
+        if not path:
+            continue
+        hints.append(path)
+        if len(hints) >= limit:
+            break
+    return hints
+
+def _infer_example_base_path(candidates: List[str], language: str, preferred_base: Optional[str] = None) -> str:
+    if preferred_base:
+        return preferred_base
+    for path in candidates:
+        path_str = str(path).strip()
+        if not path_str:
+            continue
+        if "/" in path_str:
+            return path_str.rsplit("/", 1)[0]
+    defaults = {
+        "java": "src/main/java/com/example/demo",
+        "kotlin": "src/main/kotlin/com/example",
+        "python": "app",
+        "typescript": "src",
+        "javascript": "src",
+        "csharp": "src",
+        "go": "internal",
+    }
+    return defaults.get(language.lower(), "src")
+
+def _example_extension_for_language(language: str) -> str:
+    mapping = {
+        "java": "java",
+        "kotlin": "kt",
+        "python": "py",
+        "typescript": "ts",
+        "javascript": "js",
+        "csharp": "cs",
+        "go": "go",
+    }
+    return mapping.get(language.lower(), "txt")
+
+def _fence_for_language(language: str) -> str:
+    mapping = {
+        "csharp": "csharp",
+        "java": "java",
+        "kotlin": "kotlin",
+        "python": "python",
+        "typescript": "typescript",
+        "javascript": "javascript",
+        "go": "go",
+    }
+    lang = mapping.get(language.lower(), "")
+    return f"```{lang}" if lang else "```"
+
+def _detect_existing_java_base(job: Dict[str, Any]) -> Optional[str]:
+    repo = (job.get("input") or {}).get("repo") or {}
+    repo_path_raw = repo.get("path")
+    base_rel = _normalize_repo_rel(str(repo_path_raw)) if repo_path_raw else "."
+    base_rel = base_rel or "."
+    repo_root, ok = resolve_safe_path(base_rel if base_rel != "." else ".")
+    if not ok:
+        return None
+    base_dir = repo_root / "src" / "main" / "java"
+    if not base_dir.exists():
+        return None
+    candidates: List[str] = []
+    try:
+        for idx, java_file in enumerate(sorted(base_dir.rglob("*.java"))):
+            if idx >= 400:
+                break
+            try:
+                with java_file.open("r", encoding="utf-8") as fh:
+                    for _ in range(30):
+                        line = fh.readline()
+                        if not line:
+                            break
+                        stripped = line.strip()
+                        if stripped.startswith("package "):
+                            pkg = stripped[len("package "):].split(";", 1)[0].strip()
+                            if pkg:
+                                path = f"src/main/java/{pkg.replace('.', '/')}"
+                                candidates.append(path)
+                            break
+            except Exception:
+                continue
+    except Exception:
+        return None
+    if not candidates:
+        sample = next(base_dir.rglob("*.java"), None)
+        if sample is not None:
+            try:
+                rel_parent = sample.relative_to(repo_root).parent.as_posix()
+                return rel_parent
+            except Exception:
+                return None
+        return None
+    candidates.sort(key=lambda p: (-len(p.split("/")), p))
+    return candidates[0]
+
+def _infer_component_from_path(rel_path: str) -> Optional[str]:
+    rel_lower = rel_path.lower()
+    for component, info in COMPONENT_PLACEMENT.items():
+        folder = info["folder"].lower()
+        token = f"/{folder}/"
+        if token in rel_lower:
+            return component
+        if rel_lower.endswith(f"/{folder}") or rel_lower.endswith(f"/{folder}.java"):
+            return component
+    return None
+
+def _extract_code_blocks(text: str) -> List[Tuple[str, str]]:
+    blocks: List[Tuple[str, str]] = []
+    if not text:
+        return blocks
+    for match in CODE_BLOCK_RE.finditer(text):
+        lang = (match.group(1) or "").strip().lower()
+        body = match.group(2)
+        blocks.append((lang, body))
+    return blocks
+
+def _extract_type_name(code: str) -> Optional[str]:
+    TYPE_RX = re.compile(r"\b(class|interface|record)\s+([A-Z][A-Za-z0-9_]*)")
+    m = TYPE_RX.search(code)
+    if m:
+        return m.group(2)
+    return None
+
+def _detect_component_from_code(code: str, components: List[str]) -> Optional[str]:
+    code_lower = code.lower()
+    for component in components:
+        for marker in COMPONENT_ANNOTATIONS.get(component, ()):
+            if marker in code_lower:
+                return component
+    type_name = _extract_type_name(code) or ""
+    type_lower = type_name.lower()
+    for component in components:
+        suffixes = COMPONENT_CLASS_HINTS.get(component, ())
+        if any(type_lower.endswith(suf) for suf in suffixes if suf):
+            return component
+    for component in components:
+        for keyword in COMPONENT_CLASS_HINTS.get(component, ()):
+            if keyword and keyword in code_lower:
+                return component
+    return None
+
+def _pascal_case(word: str) -> str:
+    parts = re.findall(r"[a-z0-9]+", word.lower())
+    if not parts:
+        return "Domain"
+    return "".join(part.capitalize() for part in parts)
+
+def _infer_domain_entity(goal: str) -> str:
+    goal_l = goal.lower()
+    match = re.search(r"\b([\w]+)\s+table\b", goal_l)
+    if match:
+        return _pascal_case(match.group(1))
+    for keyword in ("entity", "model", "resource"):
+        match = re.search(r"\b([\w]+)\s+" + keyword + r"\b", goal_l)
+        if match:
+            return _pascal_case(match.group(1))
+    for name in ("user","customer","account","order","product","task","item","project"):
+        if name in goal_l:
+            return _pascal_case(name)
+    return "Domain"
+
+def _component_class_name(base_entity: str, component: str) -> str:
+    suffix_map = {
+        "repository": "Repository",
+        "service": "Service",
+        "controller": "Controller",
+        "entity": "",
+        "dto": "Dto",
+    }
+    suffix = suffix_map.get(component, component.capitalize())
+    name = base_entity
+    if not suffix:
+        return name
+    return f"{name}{suffix}"
+
+def _file_matches_component(stem: str, component: str) -> bool:
+    info = COMPONENT_PLACEMENT.get(component)
+    if not info:
+        return False
+    stem_l = stem.lower()
+    return any(keyword in stem_l for keyword in info["keywords"])
+
+def _apply_component_directory_hints(
+    files_map: Dict[str, str],
+    components: List[str],
+    language: str,
+    base_candidates: List[str],
+    preferred_base: Optional[str],
+) -> Dict[str, str]:
+    if not files_map or not components:
+        return files_map
+    base_path = _infer_example_base_path(base_candidates, language, preferred_base)
+    adjusted: List[Tuple[str, str]] = []
+    for rel, data in files_map.items():
+        new_rel = rel
+        rel_norm = rel.lower()
+        stem = Path(rel).stem.lower()
+        for component in components:
+            info = COMPONENT_PLACEMENT.get(component)
+            if not info:
+                continue
+            folder = info["folder"]
+            folder_norm = folder.lower()
+            segments = rel_norm.split("/")
+            if folder_norm in segments or rel_norm.startswith(f"{folder_norm}/") or f"/{folder_norm}/" in rel_norm:
+                continue
+            if not _file_matches_component(stem, component):
+                continue
+            dest_dir = base_path
+            if dest_dir in ("", "."):
+                dest_dir = folder
+            else:
+                dest_dir_norm = dest_dir.lower()
+                if dest_dir_norm.endswith(folder_norm):
+                    dest_dir = dest_dir
+                else:
+                    dest_dir = f"{dest_dir}/{folder}"
+            filename = Path(rel).name or f"{stem}"
+            new_rel = _sanitize_rel_path(f"{dest_dir}/{filename}")
+            break
+        adjusted.append((new_rel, data))
+    return dict(adjusted)
+
+def _assign_component_blocks(
+    raw_output: str,
+    components: List[str],
+    language: str,
+    base_candidates: List[str],
+    base_entity: str,
+    preferred_base: Optional[str],
+) -> Dict[str, str]:
+    blocks = _extract_code_blocks(raw_output)
+    if not blocks or not components:
+        return {}
+    base_path = _infer_example_base_path(base_candidates, language, preferred_base)
+    ext = _example_extension_for_language(language)
+    assigned: Dict[str, str] = {}
+    used_components: set[str] = set()
+    for _, code in blocks:
+        if not code.strip():
+            continue
+        component = _detect_component_from_code(code, components)
+        if not component or component in used_components:
+            continue
+        class_name = _extract_type_name(code) or _component_class_name(base_entity, component)
+        folder = COMPONENT_PLACEMENT.get(component, {}).get("folder", component)
+        if base_path in ("", "."):
+            rel = f"{folder}/{class_name}.{ext}"
+        else:
+            rel = f"{base_path}/{folder}/{class_name}.{ext}"
+        sanitized = _sanitize_rel_path(rel)
+        body = code.strip()
+        if not body.endswith("\n"):
+            body += "\n"
+        assigned[sanitized] = body
+        used_components.add(component)
+    return assigned
+
+def _rebase_component_paths(
+    files_map: Dict[str, str],
+    preferred_base: Optional[str],
+    components: List[str],
+    notes: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    if not preferred_base or not components:
+        return files_map
+    base = preferred_base.rstrip("/")
+    rebased: Dict[str, str] = {}
+    for rel, data in files_map.items():
+        component = _infer_component_from_path(rel)
+        new_rel = rel
+        if component in components:
+            folder = COMPONENT_PLACEMENT.get(component, {}).get("folder", component)
+            class_name = Path(rel).name
+            new_rel = _sanitize_rel_path(f"{base}/{folder}/{class_name}")
+            if notes is not None and new_rel != rel:
+                notes.append(f"Adjusted {rel} -> {new_rel} to match existing package layout")
+        if new_rel in rebased:
+            existing = rebased[new_rel]
+            if len(str(data)) > len(str(existing)):
+                rebased[new_rel] = data
+        else:
+            rebased[new_rel] = data
+    return rebased
+
+def _default_component_path(
+    component: str,
+    base_candidates: List[str],
+    language: str,
+    base_entity: str,
+    preferred_base: Optional[str],
+) -> Tuple[str, str]:
+    base_path = _infer_example_base_path(base_candidates, language, preferred_base)
+    folder = COMPONENT_PLACEMENT.get(component, {}).get("folder", component)
+    class_name = _component_class_name(base_entity, component)
+    ext = _example_extension_for_language(language)
+    if base_path in ("", "."):
+        rel = f"{folder}/{class_name}.{ext}"
+    else:
+        rel = f"{base_path}/{folder}/{class_name}.{ext}"
+    return _sanitize_rel_path(rel), class_name
+
+def _path_to_java_package(rel_path: str) -> Optional[str]:
+    prefixes = ("src/main/java/", "src/test/java/")
+    for prefix in prefixes:
+        if rel_path.startswith(prefix):
+            tail = rel_path[len(prefix):]
+            if "/" not in tail:
+                return None
+            pkg = tail.rsplit("/", 1)[0].replace("/", ".")
+            return pkg
+    return None
+
+def _generate_placeholder_component(
+    component: str,
+    class_name: str,
+    rel_path: str,
+    language: str,
+) -> str:
+    lang = language.lower()
+    if lang == "java":
+        pkg = _path_to_java_package(rel_path)
+        lines: List[str] = []
+        if pkg:
+            lines.append(f"package {pkg};")
+            lines.append("")
+        lines.append(f"public class {class_name} " + "{")
+        lines.append("    // TODO: implement generated logic")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+    # Generic placeholder for other languages
+    return f"# TODO: implement {component} component ({class_name})\n"
+
+def _component_coverage(files_map: Dict[str, str], components: List[str]) -> Tuple[Dict[str, bool], List[str]]:
+    coverage: Dict[str, bool] = {c: False for c in components}
+    for rel in files_map:
+        rel_norm = rel.lower()
+        stem = Path(rel).stem.lower()
+        for component in components:
+            info = COMPONENT_PLACEMENT.get(component)
+            if not info:
+                continue
+            folder = info["folder"].lower()
+            keywords = info["keywords"]
+            if folder and (f"/{folder}/" in rel_norm or rel_norm.startswith(f"{folder}/") or rel_norm.endswith(f"/{folder}") or rel_norm == folder):
+                coverage[component] = True
+                continue
+            if _file_matches_component(stem, component):
+                coverage[component] = True
+                continue
+            if any(keyword in rel_norm for keyword in keywords):
+                coverage[component] = True
+    missing = [c for c, ok in coverage.items() if not ok]
+    return coverage, missing
+
 def _build_prompt(job: dict) -> str:
     mode = job.get("_mode", "code")
     inp = job.get("input") or {}
@@ -209,13 +799,32 @@ def _build_prompt(job: dict) -> str:
             history_items.append(f"{label}: {content}")
         history_block = "\n".join(history_items)
         history_section = f"Conversation so far:\n{history_block}\n\n" if history_block else ""
+        memory_snippets = []
+        for idx, entry in enumerate(meta.get("memory_context") or [], start=1):
+            summary = str(entry.get("summary") or "").strip()
+            goal = str(entry.get("goal") or "").strip()
+            model = str(entry.get("model") or "").strip()
+            if not summary and not goal:
+                continue
+            snippet_lines = []
+            header = f"{idx}. Prior task"
+            if goal:
+                header += f" (goal: {goal})"
+            if model:
+                header += f" [model: {model}]"
+            snippet_lines.append(header)
+            if summary:
+                trimmed = summary[:800]
+                snippet_lines.append(trimmed)
+            memory_snippets.append("\n".join(snippet_lines))
+        memory_section = f"Relevant prior completions:\n{chr(10).join(memory_snippets)}\n\n" if memory_snippets else ""
         return textwrap.dedent(f"""
         You are a friendly engineering assistant. Answer in natural language, keep responses concise, and avoid writing source code unless the user clearly asks for it.
         When the user requests code, files, scaffolds, or archives, emit the actual file contents. For every file:
           - Add a line 'File: relative/path.ext' (relative to project root).
           - Follow with a fenced code block containing the file body.
           - Do NOT reference external download links or say 'see attached zip'; provide the real content inline instead.
-        {history_section}Latest user message: {goal}
+        {memory_section}{history_section}Latest user message: {goal}
         """).strip()
 
     if mode == "docs":
@@ -240,6 +849,51 @@ def _build_prompt(job: dict) -> str:
     lang = inp.get("language", "general")
     files_str = "\n".join(f"- {p}" for p in expected_files) if expected_files else "- (decide suitable path)"
     pkg_hint, cls_hint = _derive_java_pkg_class(expected_files[0]) if (expected_files and expected_files[0].endswith(".java")) else ("", "")
+    repo_hints = _collect_repo_include_hints(job)
+    repo_section = ""
+    if repo_hints:
+        repo_lines = "\n".join(f"    - {p}" for p in repo_hints)
+        repo_section = f"Existing repository structure to mirror:\n{repo_lines}\n"
+
+    components = _detect_requested_components(goal if isinstance(goal, str) else "")
+    multi_section = ""
+    if len(components) >= 2:
+        base_candidates = expected_files or repo_hints
+        base_path = _infer_example_base_path(base_candidates, lang)
+        ext = _example_extension_for_language(lang)
+        fence = _fence_for_language(lang)
+        base_entity = _infer_domain_entity(goal if isinstance(goal, str) else "")
+        example_lines: List[str] = []
+        mandatory_lines: List[str] = []
+        for label in components:
+            folder = COMPONENT_PLACEMENT.get(label, {}).get("folder", label)
+            class_name = _component_class_name(base_entity, label)
+            if base_path in ("", "."):
+                rel_example = f"{folder}/{class_name}.{ext}"
+            else:
+                rel_example = f"{base_path}/{folder}/{class_name}.{ext}"
+            mandatory_lines.append(f"    - File: {rel_example}  ({label})")
+            example_lines.extend([
+                f"File: {rel_example}",
+                fence,
+                f"// {label} implementation goes here",
+                "```",
+            ])
+        example_block = textwrap.indent("\n".join(example_lines), "    ")
+        comp_list = ", ".join(components)
+        multi_section = (
+            f"Detected multi-component request ({comp_list}). Emit one `File:` block per component so each lives in its own source file and they share a consistent package.\n"
+            "MANDATORY FILES:\n"
+            f"{chr(10).join(mandatory_lines)}\n"
+            "Assume the necessary frameworks (e.g., Spring Boot + R2DBC) are available; do NOT ask follow-up questions—just implement the best reasonable defaults.\n"
+            "Example (do not include literally):\n"
+            f"{example_block}\n"
+            "    Replace the sample bodies with real implementations. Missing any of the mandatory files is considered incorrect.\n"
+        )
+
+    repo_section = f"{repo_section}" if repo_section else ""
+    multi_section = f"{multi_section}" if multi_section else ""
+
     return textwrap.dedent(f"""
     You are a senior {lang} engineer. Task: {goal}
     Frameworks: {frameworks}
@@ -247,6 +901,7 @@ def _build_prompt(job: dict) -> str:
     {files_str}
     Package: {pkg_hint if pkg_hint else "(decide reasonable)"}
     ClassName: {cls_hint if cls_hint else "(decide reasonable)"}
+    {repo_section}{multi_section}
 
     CRITICAL OUTPUT FORMAT:
     - For every file you create, write a line 'File: relative/path.ext' followed immediately by a fenced code block containing the entire file contents.
@@ -327,6 +982,12 @@ class JobQueue:
             if text:
                 target = Path(root) / "result.md"
                 target.write_text(text, encoding="utf-8")
+            notes = payload.get("zip_notes")
+            if isinstance(notes, list) and notes:
+                try:
+                    (Path(root) / "zip-notes.txt").write_text("\n".join(str(n) for n in notes), encoding="utf-8")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -336,9 +997,15 @@ class JobQueue:
         set_candidate(model_str)
         t0 = time.time()
         mode = job.get("_mode", "code")
+        inp = job.get("input") or {}
+        lang_hint = str(inp.get("language") or "general")
+        goal_text = str(inp.get("goal") or "")
+        components = _detect_requested_components(goal_text)
+        base_entity = _infer_domain_entity(goal_text)
+        repo_hints = _collect_repo_include_hints(job)
+        existing_java_base = _detect_existing_java_base(job)
 
         # isolated dir
-        from .fs_sandbox import resolve_safe_path
         from .governance import enforce_fs_write
         safe_model = model_str.replace("/", "_").replace(":", "_").replace("-", "_")
         rel_dir = f".duel/{task_id}/{safe_model}"
@@ -393,12 +1060,117 @@ class JobQueue:
             new_map.update(files_map)
             files_map = new_map
 
-        primary_rel = next(iter(files_map))
+        component_notes: List[str] = []
+        missing_components: List[str] = []
+        follow_up_steps: List[str] = []
+        if components:
+            base_candidates = expected or repo_hints
+            rebase_notes: List[str] = []
+            files_map = _rebase_component_paths(files_map, existing_java_base, components, rebase_notes)
+            component_notes.extend(rebase_notes)
+            for note in rebase_notes:
+                follow_up_steps.append(f"Review adjusted path: {note}")
+            component_files = _assign_component_blocks(raw_output, components, lang_hint, base_candidates, base_entity, existing_java_base)
+            if component_files:
+                files_map.update(component_files)
+                if rel_primary in files_map and rel_primary.endswith(".txt"):
+                    files_map.pop(rel_primary, None)
+            files_map = _rebase_component_paths(files_map, existing_java_base, components, component_notes)
+            files_map = _apply_component_directory_hints(files_map, components, lang_hint, base_candidates, existing_java_base)
+            files_map = _rebase_component_paths(files_map, existing_java_base, components, component_notes)
+            _, missing_components = _component_coverage(files_map, components)
+            if missing_components:
+                component_notes.append("Missing component files for: " + ", ".join(missing_components))
+                placeholder_added = False
+                for comp in missing_components:
+                    rel_path, cls_name = _default_component_path(comp, base_candidates, lang_hint, base_entity, existing_java_base)
+                    if rel_path in files_map:
+                        continue
+                    placeholder = _generate_placeholder_component(comp, cls_name, rel_path, lang_hint)
+                    files_map[rel_path] = placeholder
+                    component_notes.append(f"Placeholder generated for {comp}")
+                    follow_up_steps.append(f"Replace placeholder {rel_path} with full implementation.")
+                    placeholder_added = True
+                if placeholder_added:
+                    if rel_primary in files_map and rel_primary.endswith(".txt"):
+                        files_map.pop(rel_primary, None)
+                    _, missing_components = _component_coverage(files_map, components)
+                    if missing_components:
+                        component_notes.append("Placeholders could not satisfy: " + ", ".join(missing_components))
+                        follow_up_steps.append("Some components still missing after placeholder pass: " + ", ".join(missing_components))
+
+        if components:
+            primary_rel = next((rel for rel in files_map if rel.lower().endswith((".java", ".py", ".ts", ".js", ".cs", ".go"))), None)
+            if not primary_rel:
+                primary_rel = next(iter(files_map))
+        else:
+            primary_rel = next(iter(files_map))
         primary_path = await self._write_primary(primary_rel, dir_path, files_map[primary_rel])
         for rel, data in files_map.items():
             if rel == primary_rel:
                 continue
             await self._write_primary(rel, dir_path, data)
+
+        # Mirror generated files into workspace under the target repo path
+        repo_spec = (job.get("input") or {}).get("repo") or {}
+        repo_path_raw = repo_spec.get("path")
+        if repo_path_raw:
+            base_rel = _normalize_repo_rel(repo_path_raw)
+        else:
+            base_rel = "."
+
+        normalized_files_map: Dict[str, str] = {}
+        base_prefix = base_rel.rstrip("/") if base_rel not in (".", "") else ""
+
+        for rel, data in files_map.items():
+            dest_rel = rel if base_rel in (".", "") else f"{base_rel}/{rel}"
+            dest_path, ok = resolve_safe_path(dest_rel)
+            if not ok:
+                continue
+            try:
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                text_payload = data if isinstance(data, str) else str(data)
+                if text_payload and not text_payload.endswith("\n"):
+                    text_payload = text_payload + "\n"
+                dest_path.write_text(text_payload, encoding="utf-8")
+                if dest_path.suffix.lower() == ".java":
+                    fix_java_package(dest_path)
+                    dest_path = fix_java_filename(dest_path)
+            except Exception:
+                pass
+            trimmed_rel = rel
+            if base_prefix and trimmed_rel.startswith(base_prefix + "/"):
+                trimmed_rel = trimmed_rel[len(base_prefix) + 1 :]
+            elif base_prefix and trimmed_rel == base_prefix:
+                trimmed_rel = ""
+            trimmed_rel = trimmed_rel or rel
+            normalized_files_map[trimmed_rel] = data
+
+        if normalized_files_map:
+            files_map = normalized_files_map
+
+        merge_rel, merge_root = ensure_merge_tree(str(task_id), base_rel)
+
+        for rel, data in files_map.items():
+            target = merge_root / rel
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                text_payload = data if isinstance(data, str) else str(data)
+                if text_payload and not text_payload.endswith("\n"):
+                    text_payload = text_payload + "\n"
+                target.write_text(text_payload, encoding="utf-8")
+                if target.suffix.lower() == ".java":
+                    fix_java_package(target)
+                    target = fix_java_filename(target)
+            except Exception:
+                pass
+
+        try:
+            response_path = merge_root / "response.md"
+            response_payload = content if content is not None else ""
+            response_path.write_text(response_payload, encoding="utf-8")
+        except Exception:
+            pass
 
         # Build & tests
         compile_pass = False
@@ -428,19 +1200,44 @@ class JobQueue:
         content = to_write if to_write is not None else ""
         zip_path = None
         zip_url = None
+        zip_notes: List[str] = []
+        zip_notes.extend(component_notes)
+        follow_up_steps = list(dict.fromkeys(step for step in follow_up_steps if step.strip()))
+        if component_notes and not follow_up_steps:
+            follow_up_steps.append("Review generated components for alignment with existing codebase.")
+        if follow_up_steps:
+            zip_notes.append("Follow-up:")
+            zip_notes.extend(f"- {step}" for step in follow_up_steps)
         try:
-            zip_files = dict(files_map)
-            zip_files.setdefault("response.md", content if content is not None else "")
-            if any(v.strip() for v in zip_files.values()):
+            zip_files: Dict[str, str] = {}
+            for path in merge_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel_name = path.relative_to(merge_root).as_posix()
+                try:
+                    text_payload = path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    text_payload = path.read_text(encoding="latin-1", errors="ignore")
+                zip_files[rel_name] = text_payload
+            if zip_files:
                 zip_file = write_zip(str(task_id), zip_files)
                 zip_path = str(zip_file)
                 zip_url = f"/zips/{zip_file.name}"
-        except Exception:
+        except Exception as exc:
             zip_path = None
             zip_url = None
+            msg = str(exc)
+            if msg:
+                zip_notes.append(f"Zip assembly failed: {msg}")
+            else:
+                zip_notes.append("Zip assembly failed.")
+        has_primary = bool(content.strip())
+        has_zip = bool(zip_url)
+        has_artifact = bool(str(primary_path))
+        success_flag = bool(test_pass or compile_pass) and not missing_components
         __RET__ = {
             "model": model_str,
-            "success": bool(test_pass or compile_pass),
+            "success": success_flag,
             "latency_ms": latency_ms,
             "speed_rank": int(candidate.get("speed_rank", 999)),
             "human_score": 0,
@@ -451,7 +1248,12 @@ class JobQueue:
             "artifact": str(primary_path),
             "content": content,
             "zip_path": zip_path,
-            "zip_url": zip_url
+            "zip_url": zip_url,
+            "files": files_map,
+            "zip_notes": zip_notes,
+            "pending_final": bool(missing_components) or not (has_primary or has_zip or has_artifact),
+            "missing_components": missing_components,
+            "follow_up_steps": follow_up_steps,
         }
         # --- Bandit autolog (inserted) ---
         try:
@@ -486,7 +1288,8 @@ class JobQueue:
                 "tool": "timeout",
                 "logs": {"build_stdout_tail": "", "build_stderr_tail": f"candidate timed out after {CANDIDATE_TIMEOUT_SEC}s"},
                 "artifact": "",
-                "content": ""
+                "content": "",
+                "pending_final": False,
             }
             # --- Bandit autolog (inserted) ---
             try:
@@ -565,6 +1368,10 @@ class JobQueue:
             elif mode == "planner":
                 language_hint = "planner"
 
+            force_duel = bool((job.get("metadata") or {}).get("force_duel")) or FORCE_DUEL
+            if force_duel:
+                is_duel = True
+
             try:
                 if not is_duel:
                     base_models = available_models(language_hint)
@@ -596,7 +1403,8 @@ class JobQueue:
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
                         "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
                         "content": res.get("content"),
-                        "zip_url": res.get("zip_url")
+                        "zip_url": res.get("zip_url"),
+                        "zip_notes": res.get("zip_notes"),
                     })
 
                     await self.hub.publish(str(id), json.dumps({
@@ -605,8 +1413,18 @@ class JobQueue:
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
                         "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
                         "content": res.get("content"),
-                        "zip_url": res.get("zip_url")
+                        "zip_url": res.get("zip_url"),
+                        "zip_notes": res.get("zip_notes"),
+                        "pending_final": bool(res.get("pending_final")),
                     }))
+                    try:
+                        res["status"] = res.get("status") or "done"
+                    except Exception:
+                        pass
+                    try:
+                        await record_completion(str(id), job, res)
+                    except Exception:
+                        pass
                 else:
                     cand_names: List[str] = duel_cfg.get("duel_candidates") or []
                     reg_models = _order_models_for_mode(mode, available_models(language_hint))
@@ -632,7 +1450,8 @@ class JobQueue:
                             "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
                             "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
                             "content": res.get("content"),
-                            "zip_url": res.get("zip_url")
+                            "zip_url": res.get("zip_url"),
+                            "zip_notes": res.get("zip_notes"),
                         })
 
                         await self.hub.publish(str(id), json.dumps({
@@ -645,8 +1464,18 @@ class JobQueue:
                             "artifact":res.get("artifact"),
                             "logs":res.get("logs"),
                             "content": res.get("content"),
-                            "zip_url": res.get("zip_url")
+                            "zip_url": res.get("zip_url"),
+                            "zip_notes": res.get("zip_notes"),
+                            "pending_final": bool(res.get("pending_final")),
                         }))
+                        try:
+                            res["status"] = res.get("status") or "done"
+                        except Exception:
+                            pass
+                        try:
+                            await record_completion(str(id), job, res)
+                        except Exception:
+                            pass
                         self.queue.task_done()
                         self._inflight.pop(str(id), None)
                         continue
@@ -685,14 +1514,18 @@ class JobQueue:
                         "metrics":{"success":a_res["success"],"latency_ms":a_res["latency_ms"],"compile_pass":a_res["compile_pass"],"test_pass":a_res["test_pass"]},
                         "tool":a_res["tool"], "artifact":a_res["artifact"], "logs":a_res["logs"],
                         "content": a_res.get("content"),
-                        "zip_url": a_res.get("zip_url")
+                        "zip_url": a_res.get("zip_url"),
+                        "zip_notes": a_res.get("zip_notes"),
+                        "pending_final": bool(a_res.get("pending_final")),
                     }))
                     await self.hub.publish(str(id), json.dumps({
                         "phase":"duel","candidate":b_res["model"],"status":"done",
                         "metrics":{"success":b_res["success"],"latency_ms":b_res["latency_ms"],"compile_pass":b_res["compile_pass"],"test_pass":b_res["test_pass"]},
                         "tool":b_res["tool"], "artifact":b_res["artifact"], "logs":b_res["logs"],
                         "content": b_res.get("content"),
-                        "zip_url": b_res.get("zip_url")
+                        "zip_url": b_res.get("zip_url"),
+                        "zip_notes": b_res.get("zip_notes"),
+                        "pending_final": bool(b_res.get("pending_final")),
                     }))
 
                     cfg = get_duel_config()
@@ -732,6 +1565,8 @@ class JobQueue:
                         await upsert_stat(conn, winner["model"], fh, reward_w)
                         await upsert_stat(conn, loser["model"], fh, reward_l)
 
+                    winner_has_final = bool(str(winner.get("content") or "").strip()) or bool(winner.get("zip_url")) or bool(winner.get("artifact"))
+
                     # artifact for duel completion
                     self._write_artifact_safely(str(id), {
                         "status":"done","mode":"duel",
@@ -742,7 +1577,8 @@ class JobQueue:
                         "loser_metrics":{"success":loser["success"], "latency_ms":loser["latency_ms"],
                                          "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]},
                         "content": winner.get("content"),
-                        "zip_url": winner.get("zip_url")
+                        "zip_url": winner.get("zip_url"),
+                        "zip_notes": winner.get("zip_notes"),
                     })
 
                     await self.hub.publish(str(id), json.dumps({
@@ -754,8 +1590,18 @@ class JobQueue:
                         "loser_metrics":{"success":loser["success"], "latency_ms":loser["latency_ms"],
                                          "compile_pass":loser["compile_pass"], "test_pass":loser["test_pass"], "tool":loser["tool"]},
                         "content": winner.get("content"),
-                        "zip_url": winner.get("zip_url")
+                        "zip_url": winner.get("zip_url"),
+                        "zip_notes": winner.get("zip_notes"),
+                        "pending_final": not winner_has_final,
                     }))
+                    try:
+                        winner_payload = dict(winner)
+                        winner_payload.setdefault("status", "done")
+                        winner_payload.setdefault("mode", "duel")
+                        winner_payload.setdefault("pending_final", not winner_has_final)
+                        await record_completion(str(id), job, winner_payload)
+                    except Exception:
+                        pass
             except asyncio.CancelledError:
                 # task canceled
                 async with eng.begin() as conn:

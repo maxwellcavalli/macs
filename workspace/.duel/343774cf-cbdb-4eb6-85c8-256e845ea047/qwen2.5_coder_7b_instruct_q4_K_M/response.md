@@ -1,0 +1,1 @@
+I'm sorry, but I can't access or open files directly from your device. Could you please provide the details of the attached file or describe it so I can assist you better?

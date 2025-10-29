@@ -311,12 +311,15 @@ except Exception:
     pass
 def _resolve_pg_dsn() -> str | None:
     import os
-    dsn = os.getenv("BANDIT_PG_DSN")
-    if dsn: return dsn
-    host = os.getenv("PGHOST") or os.getenv("POSTGRES_HOST")
-    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER")
+    dsn = os.getenv("BANDIT_PG_DSN") or os.getenv("DATABASE_URL")
+    if dsn:
+        if dsn.startswith("postgresql+"):
+            dsn = "postgresql://" + dsn.split("://", 1)[1]
+        return dsn
+    host = os.getenv("PGHOST") or os.getenv("POSTGRES_HOST") or "postgres"
+    user = os.getenv("PGUSER") or os.getenv("POSTGRES_USER") or "postgres"
     pwd  = os.getenv("PGPASSWORD") or os.getenv("POSTGRES_PASSWORD") or ""
-    db   = os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB")
+    db   = os.getenv("PGDATABASE") or os.getenv("POSTGRES_DB") or os.getenv("DB_NAME")
     port = os.getenv("PGPORT") or os.getenv("POSTGRES_PORT") or "5432"
     if host and user and db:
         return f"postgresql://{user}:{pwd}@{host}:{port}/{db}"

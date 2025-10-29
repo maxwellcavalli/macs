@@ -41,9 +41,29 @@ rag-eval: ## Run retrieval eval and write report
 otel-validate: ## Rebuild API and assert OTel headers + spans
 > API_URL="$(API_URL)" bash scripts/validate_otel.sh
 
+.PHONY: restart-all
+restart-all: ## Rebuild and restart all compose services
+> docker compose up -d --build
+
+.PHONY: up-api
+up-api: ## Build and start API service only
+> docker compose up -d --build api
+
 .PHONY: hardening-validate
 hardening-validate: ## Assert request size limit returns 413 with JSON error
 > API_URL="$(API_URL)" MACS_MAX_BODY_BYTES="$(MACS_MAX_BODY_BYTES)" bash scripts/validate_hardening.sh
+
+.PHONY: flyway-repair
+flyway-repair: ## Repair Flyway schema history via docker compose
+> ./scripts/flyway_repair.sh
+
+.PHONY: flyway-migrate
+flyway-migrate: ## Run Flyway migrations via docker compose
+> ./scripts/flyway_migrate.sh
+
+.PHONY: memory-ingest
+memory-ingest: ## Bootstrap existing repo files into workspace memory
+> ./tools/memory_ingest_repo.py --root ./workspace
 
 .PHONY: factory-validate
 factory-validate: ## 413 check via factory-wrapped ASGI limiter

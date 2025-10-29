@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     model_registry_path: str = Field("./config/models.yaml", alias="MODEL_REGISTRY_PATH")
     ff_smoke_tests: bool = Field(True, alias="FF_SMOKE_TESTS")
     ff_standards_enforce: str = Field("soft", alias="FF_STANDARDS_ENFORCE")
+    workspace_memory_enabled: bool = Field(False, alias="WORKSPACE_MEMORY_ENABLED")
+    workspace_memory_embeddings: bool = Field(False, alias="WORKSPACE_MEMORY_EMBEDDINGS")
 
     class Config:
         env_file = ".env"

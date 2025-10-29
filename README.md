@@ -23,6 +23,22 @@ docker compose up -d --build
 
 # See status
 docker compose ps
+
+### Tunable runtime settings
+
+The API and runner expose a few environment variables that influence how quickly results surface and whether a request is evaluated by one or multiple models. Defaults are set in `docker-compose.yml`, and you can override them per deployment:
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `SSE_DB_POLL_INTERVAL` | How often (seconds) the SSE stream polls the database once an artifact isn’t found immediately. Lower values surface results faster but incur more DB queries. | `1.0` |
+| `FINAL_WAIT_SECONDS` | Upper bound (seconds) that `/v1/tasks/{id}/final` will wait before returning `404`. Helps avoid the initial 404 seen during cold starts. | `60.0` |
+| `FINAL_WAIT_INTERVAL` | How frequently the `/final` endpoint re-checks for artifacts during that wait window. | `0.2` |
+| `SSE_FINAL_WAIT_SECONDS` | How long SSE waits for the persisted final payload before emitting a `done` event. | `120.0` |
+| `FORCE_DUEL` | When set to `1`, every task runs in duel mode (two models compete, best result returned). Leave at `0` to let the router decide per request. | `1` |
+| `DUEL_TIMEOUT_SEC` | Maximum seconds to wait for both duel candidates before picking a winner. | `240` |
+| `CANDIDATE_TIMEOUT_SEC` | Per-model generation timeout used by the queue. | `240` |
+
+You can also flip duel mode per request by adding `metadata.force_duel = true` to the task payload.
 ```
 
 ### Health checks
@@ -120,6 +136,17 @@ API_HOST_PORT=18080 PG_HOST_PORT=56432 PROM_HOST_PORT=49090 GRAFANA_HOST_PORT=43
 | Prometheus | 39090                | 9090     | Scrapes API `/metrics`                       |
 | Grafana    | 33000                | 3000     | Pre-provisioned Prometheus datasource        |
 | Ollama     | _none_               | 11434    | Internal-only by default (GPU)               |
+
+---
+
+## 8) Workspace memory (opt-in)
+
+- Enable persistence with `WORKSPACE_MEMORY_ENABLED=1` (optional embeddings flag: `WORKSPACE_MEMORY_EMBEDDINGS=0/1`).
+- Completed tasks are stored in `workspace_memories` via the queue; data remains in Postgres.
+- Query recent results with `GET /v1/memory/search?repo=...&language=...&query=...` (requires API key).
+- Fetch a specific record with `GET /v1/memory/{memory_id}`.
+- Disable the feature by omitting the env var or setting it to `0`.
+- Bootstrap existing files: `make memory-ingest` (or run `tools/memory_ingest_repo.py --root ./workspace`), then restart the API so new context is available to chat prompts.
 
 ---
 

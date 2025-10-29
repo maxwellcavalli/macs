@@ -1,11 +1,14 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pathlib import Path
-from typing import Any, Mapping
-import json
+from typing import Any, Mapping, Optional
+import json, asyncio, os, time
 from .artifacts import _resolve_root
 
 router = APIRouter()
+
+FINAL_WAIT_SECONDS = float(os.getenv("FINAL_WAIT_SECONDS", "2.0") or "0")
+FINAL_WAIT_INTERVAL = max(0.05, float(os.getenv("FINAL_WAIT_INTERVAL", "0.2") or "0.2"))
 
 def _normalize_status(s: str | None) -> str | None:
     if not s: return s
@@ -54,8 +57,7 @@ def _row_to_payload(row: Any, task_id: str) -> dict[str, Any]:
     keep = {"id","status","model_used","latency_ms","template_ver","result","output","message","content","note"}
     return {k:v for k,v in d.items() if k in keep}
 
-@router.get("/v1/tasks/{task_id}/final")
-async def get_task_final(task_id: str, request: Request):
+async def _synthesize_payload(task_id: str, request: Request) -> Optional[dict[str, Any]]:
     # 1) Try repository on app.state if present
     try:
         repo = getattr(request.app.state, "task_repo", None)
@@ -69,7 +71,7 @@ async def get_task_final(task_id: str, request: Request):
                         payload.setdefault("result", extra.get("content"))
                     if extra.get("zip_url"):
                         payload["zip_url"] = extra.get("zip_url")
-                return JSONResponse(payload)
+                return payload
     except Exception:
         pass
     # 2) Fallback to artifacts
@@ -82,5 +84,21 @@ async def get_task_final(task_id: str, request: Request):
             payload["zip_url"] = extra["zip_url"]
         if not payload["result"] and extra.get("content"):
             payload["result"] = extra["content"]
-        return JSONResponse(payload)
+        return payload
+    return None
+
+@router.get("/v1/tasks/{task_id}/final")
+async def get_task_final(task_id: str, request: Request):
+    if FINAL_WAIT_SECONDS <= 0:
+        payload = await _synthesize_payload(task_id, request)
+        if payload is not None:
+            return JSONResponse(payload)
+        raise HTTPException(status_code=404, detail="task not found")
+
+    deadline = time.monotonic() + FINAL_WAIT_SECONDS
+    while time.monotonic() <= deadline:
+        payload = await _synthesize_payload(task_id, request)
+        if payload is not None:
+            return JSONResponse(payload)
+        await asyncio.sleep(FINAL_WAIT_INTERVAL)
     raise HTTPException(status_code=404, detail="task not found")

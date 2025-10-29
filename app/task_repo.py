@@ -7,14 +7,34 @@ class TaskRepo:
 
     @classmethod
     def from_env(cls):
-        dsn = os.getenv("DB_DSN")
+        dsn = os.getenv("DB_DSN") or os.getenv("DATABASE_URL")
         if dsn:
+            if dsn.startswith("postgresql+asyncpg://"):
+                dsn = "postgresql://" + dsn.split("://", 1)[1]
+            elif dsn.startswith("postgresql+psycopg://"):
+                dsn = "postgresql://" + dsn.split("://", 1)[1]
             return cls(dsn=dsn)
-        host = os.getenv("PGHOST", "pg")
+        host = (
+            os.getenv("PGHOST")
+            or os.getenv("POSTGRES_HOST")
+            or "postgres"
+        )
         port = int(os.getenv("PGPORT", "5432"))
-        user = os.getenv("PGUSER", "postgres")
-        password = os.getenv("PGPASSWORD", "postgres")
-        database = os.getenv("PGDATABASE", os.getenv("DB_NAME","macs"))
+        user = (
+            os.getenv("PGUSER")
+            or os.getenv("POSTGRES_USER")
+            or "postgres"
+        )
+        password = (
+            os.getenv("PGPASSWORD")
+            or os.getenv("POSTGRES_PASSWORD")
+            or "postgres"
+        )
+        database = (
+            os.getenv("PGDATABASE")
+            or os.getenv("POSTGRES_DB")
+            or os.getenv("DB_NAME", "macs")
+        )
         return cls(host=host, port=port, user=user, password=password, database=database)
 
     async def _connect(self):

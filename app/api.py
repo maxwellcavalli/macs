@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import html
-
-from fastapi.responses import HTMLResponse
-from fastapi.responses import JSONResponse
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import uuid, json
-from fastapi import Request, APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
-from .db import get_engine, get_task
-import time
+import io
+import json
 import os
+import time
+import uuid
+import zipfile
 from pathlib import Path
-from typing import Optional
-from .schemas import TaskV11, TaskStatus, FeedbackV1
+from typing import Dict, List, Optional
+
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from .schemas import (
+    TaskV11,
+    TaskStatus,
+    FeedbackV1,
+    WorkspaceMemory,
+    WorkspaceMemorySearchResponse,
+)
 from .settings import settings
 from .sse import StreamHub
 from .db import get_engine, insert_task, update_task_status, get_task
@@ -25,6 +31,11 @@ from .ollama_health import get_ollama_health
 from .ratelimit import check_allow, peek_state
 from .logging_setup import get_logger
 from .metrics import sse_terminated_total
+from .memory import search_memories, get_memory, record_upload_bundle
+from .fs_sandbox import resolve_safe_path
+from .java_utils import fix_java_package, fix_java_filename
+from .final_api import _synthesize_payload
+from .workspace_io import stage_upload
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -33,6 +44,14 @@ hub: StreamHub = StreamHub()
 job_queue = None  # set in main
 
 ZIP_ROOT = Path(os.getenv("ZIP_DIR", "/data/zips"))
+
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_UPLOAD_FILES = 200
+MAX_UPLOAD_CONTENT_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_MEMORY_FILES = 10
+MAX_UPLOAD_SNIPPET_BYTES = 1024
+SUMMARY_LIMIT_BYTES = 4096
+MEMORY_UPLOAD_EXTRACT = (os.getenv("MEMORY_UPLOAD_EXTRACT", "1") or "1").lower() not in {"0","false","no"}
 
 
 def _ratelimit_guard(x_api_key: str|None):
@@ -103,7 +122,31 @@ async def submit_task(task: TaskV11, request: Request, x_api_key: str | None = H
     q = job_queue or getattr(request.app.state, 'job_queue', None)
     if q is None:
         raise HTTPException(status_code=503, detail='job queue not ready')
-    await q.submit(task.model_dump())
+    payload = task.model_dump()
+    metadata = payload.get("metadata") or {}
+    ctx_ids = metadata.get("memory_context_ids") or []
+    if ctx_ids:
+        snippets = []
+        for mem_id in ctx_ids:
+            try:
+                record = await get_memory(str(mem_id))
+            except Exception:
+                record = None
+            if not record:
+                continue
+            summary = (record.get("summary") or "")[:800]
+            snippets.append({
+                "id": str(record.get("id")),
+                "goal": record.get("goal"),
+                "summary": summary,
+                "model": record.get("model"),
+                "created_at": record.get("created_at"),
+                "files": record.get("files") or {},
+            })
+        if snippets:
+            metadata["memory_context"] = snippets
+    payload["metadata"] = metadata
+    await q.submit(payload)
     return {"task_id": str(task.id)}
 
 @router.get("/v1/tasks/{task_id}")
@@ -151,17 +194,325 @@ async def submit_feedback(feedback: FeedbackV1, x_api_key: str | None = Header(N
         """), dict(model=feedback.model, fh="manual", r=(1.0 if feedback.success else 0.0)+bonus, r2=((1.0 if feedback.success else 0.0)+bonus)**2))
     return {"ok": True}
 
+
+@router.get(
+    "/v1/memory/search",
+    response_model=WorkspaceMemorySearchResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def workspace_memory_search(
+    repo: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    query: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+    limit: int = Query(5, ge=1, le=25),
+):
+    if not settings.workspace_memory_enabled:
+        return WorkspaceMemorySearchResponse(memories=[])
+    records = await search_memories(
+        repo_path=repo,
+        language=language,
+        query=query,
+        session_id=session_id,
+        limit=limit,
+    )
+    return WorkspaceMemorySearchResponse(
+        memories=[WorkspaceMemory(**row) for row in records]
+    )
+
+
+@router.get(
+    "/v1/memory/{memory_id}",
+    response_model=WorkspaceMemory,
+    dependencies=[Depends(require_api_key)],
+)
+async def workspace_memory_detail(memory_id: uuid.UUID):
+    if not settings.workspace_memory_enabled:
+        raise HTTPException(status_code=404, detail="workspace memory disabled")
+    record = await get_memory(str(memory_id))
+    if not record:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return WorkspaceMemory(**record)
+
+
+@router.post(
+    "/v1/memory/upload",
+    dependencies=[Depends(require_api_key)],
+)
+async def workspace_memory_upload(
+    file: UploadFile = File(...),
+    session_id: Optional[str] = Form(None),
+    repo_path: Optional[str] = Form(None),
+):
+    if not settings.workspace_memory_enabled:
+        raise HTTPException(status_code=503, detail="workspace memory disabled")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="upload too large (max 10MB)")
+
+    try:
+        session_uuid = str(uuid.UUID(session_id)) if session_id else str(uuid.uuid4())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+    def _clean_relative(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        value = str(value).strip().replace("\\", "/")
+        while value.startswith("./"):
+            value = value[2:]
+        value = value.strip("/")
+        parts = [part for part in value.split("/") if part and part not in {".", ".."}]
+        return "/".join(parts)
+
+    repo_label_input = _clean_relative(repo_path)
+
+    try:
+        zip_file = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="upload must be a zip archive")
+
+    # Remove prior upload memories for this session (and legacy rows without session_id)
+    try:
+        engine = await get_engine()
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    DELETE FROM public.workspace_memories
+                    WHERE mode = 'upload' AND (session_id = :sid OR (session_id IS NULL AND model = 'memory-upload'))
+                    """
+                ),
+                {"sid": session_uuid},
+            )
+    except Exception:
+        pass
+
+    texts: list[tuple[str, str, bytes]] = []
+    try:
+        members = [zi for zi in zip_file.infolist() if not zi.is_dir()]
+        if len(members) > MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=400, detail="too many files in archive (limit 200)")
+        total_uncompressed = sum(zi.file_size for zi in members)
+        if total_uncompressed > MAX_UPLOAD_CONTENT_BYTES:
+            raise HTTPException(status_code=400, detail="archive content too large (limit 20MB)")
+        for info in members:
+            if info.file_size > MAX_UPLOAD_BYTES:
+                continue
+            name = info.filename
+            if not name or name.endswith("/"):
+                continue
+            path_obj = Path(name)
+            if any(part in {"..", ""} for part in path_obj.parts):
+                continue
+            try:
+                content_bytes = zip_file.read(info)
+            except Exception:
+                continue
+            if len(content_bytes) > MAX_UPLOAD_BYTES:
+                content_bytes = content_bytes[:MAX_UPLOAD_BYTES]
+            try:
+                text = content_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = content_bytes.decode("latin-1")
+                except Exception:
+                    continue
+            texts.append((path_obj.as_posix(), text, content_bytes))
+    finally:
+        zip_file.close()
+
+    if not texts:
+        raise HTTPException(status_code=400, detail="archive contained no usable text files")
+
+    raw_entries: List[tuple[str, str, bytes]] = []
+    for rel_path, content, content_bytes in texts:
+        raw_entries.append((rel_path, content, content_bytes))
+
+    root_candidates = {
+        Path(rel_path).parts[0]
+        for rel_path, _, _ in raw_entries
+        if Path(rel_path).parts
+    }
+    flatten_root = None
+    if not repo_label_input and len(root_candidates) == 1:
+        flatten_root = next(iter(root_candidates))
+
+    def _adjust_rel(rel: str) -> Optional[str]:
+        parts = list(Path(rel).parts)
+        if not parts:
+            return None
+        if flatten_root and parts[0] == flatten_root:
+            parts = parts[1:]
+        adjusted = "/".join(parts)
+        return adjusted or None
+
+    trimmed_files: List[tuple[str, str]] = []
+    adjusted_entries: List[tuple[str, bytes]] = []
+    for rel_path, content, content_bytes in raw_entries:
+        adjusted_rel = _adjust_rel(rel_path) or rel_path
+        snippet = content[:MAX_UPLOAD_SNIPPET_BYTES]
+        trimmed_files.append((adjusted_rel, snippet))
+        adjusted_entries.append((adjusted_rel, content_bytes))
+
+    files_payload: Dict[str, Any] = {"files": {}}
+    for rel_path, snippet in trimmed_files[:MAX_UPLOAD_MEMORY_FILES]:
+        files_payload["files"][rel_path] = snippet
+    if trimmed_files:
+        files_payload["artifact"] = trimmed_files[0][0]
+
+    def build_summary(entries: List[tuple[str, str]]) -> str:
+        parts: List[str] = []
+        total = 0
+        for rel, snippet in entries:
+            chunk = f"File: {rel}\n{snippet}\n"
+            parts.append(chunk)
+            total += len(chunk)
+            if total >= SUMMARY_LIMIT_BYTES:
+                break
+        summary_text = "".join(parts)
+        if len(summary_text) > SUMMARY_LIMIT_BYTES:
+            summary_text = summary_text[: SUMMARY_LIMIT_BYTES - 3] + "..."
+        return summary_text
+
+    summary_text = build_summary(trimmed_files)
+    goal_text = f"Uploaded archive ({file.filename or 'upload.zip'})"
+
+    repo_rel_base, extracted_files, workspace_path = stage_upload(session_uuid, repo_label_input, adjusted_entries)
+
+    row = await record_upload_bundle(
+        session_id=session_uuid,
+        repo_path=repo_rel_base,
+        goal=goal_text,
+        summary=summary_text,
+        files_payload=files_payload,
+        model="memory-upload",
+    )
+
+    if not row:
+        raise HTTPException(status_code=400, detail="no files ingested")
+
+    return {
+        "session_id": session_uuid,
+        "repo_path": repo_rel_base,
+        "memories": [
+            {
+                "id": str(row.get("id")),
+                "goal": row.get("goal"),
+                "summary": row.get("summary"),
+                "model": row.get("model"),
+                "language": row.get("language"),
+                "created_at": row.get("created_at"),
+            }
+        ],
+        "extracted_files": extracted_files,
+        "workspace_path": workspace_path,
+    }
+
+
 @router.get("/v1/stream/{task_id}")
-async def stream_task(task_id: uuid.UUID):
+async def stream_task(task_id: uuid.UUID, request: Request):
     async def event_gen():
 
         last_check = 0.0
         last_db_check = 0.0
+        db_poll_interval = max(0.5, float(os.getenv("SSE_DB_POLL_INTERVAL", "2.0") or "2.0"))
+        final_wait_max = max(1.0, float(os.getenv("SSE_FINAL_WAIT_SECONDS", "20.0") or "20.0"))
+        final_retry_interval = max(0.05, float(os.getenv("SSE_FINAL_RETRY_INTERVAL", "0.2") or "0.2"))
+
+        async def fetch_final_payload() -> Optional[dict]:
+            try:
+                payload = await _synthesize_payload(str(task_id), request)
+                if payload:
+                    payload.setdefault("status", "done")
+                    payload["pending_final"] = False
+                return payload
+            except Exception:
+                return None
+
+        async def wait_for_final_payload() -> Optional[dict]:
+            deadline = time.time() + final_wait_max
+            while True:
+                payload = await fetch_final_payload()
+                if payload is not None:
+                    return payload
+                if time.time() >= deadline:
+                    return None
+                await asyncio.sleep(final_retry_interval)
+
+        def rebuild_chunk(original: str, data: dict, event_override: Optional[str] = None) -> str:
+            event_name = event_override
+            if event_name is None:
+                for line in original.splitlines():
+                    if line.startswith("event: "):
+                        event_name = line[7:].strip()
+                        break
+            payload_text = json.dumps(data)
+            if event_name:
+                return f"event: {event_name}\ndata: {payload_text}\n\n"
+            return f"data: {payload_text}\n\n"
+
         async for chunk in hub.stream(str(task_id), heartbeat_seconds=10):
-            # forward hub chunk
-            yield chunk
-            # Close when 'done' (or error/canceled) shows up in the stream payload
-            if ('"status":"done"' in chunk) or ('"status":"error"' in chunk) or ('"status":"canceled"' in chunk):
+            parsed_payload = None
+            event_name = None
+            if chunk.startswith("data: "):
+                raw = chunk[6:].strip()
+                try:
+                    parsed_payload = json.loads(raw)
+                except Exception:
+                    parsed_payload = None
+            elif chunk.startswith("event: "):
+                lines = chunk.splitlines()
+                for line in lines:
+                    if line.startswith("event: "):
+                        event_name = line[7:].strip()
+                    if line.startswith("data: "):
+                        raw = line[6:].strip()
+                        try:
+                            parsed_payload = json.loads(raw)
+                        except Exception:
+                            parsed_payload = None
+                        break
+            chunk_to_send = chunk
+
+            # forward chunk to client
+            if parsed_payload and parsed_payload.get("status") == "done":
+                # Merge final payload to ensure readiness
+                final_payload = await wait_for_final_payload()
+                if final_payload is None:
+                    await asyncio.sleep(final_retry_interval)
+                    continue
+                merge_keys = (
+                    "model", "latency_ms", "compile_pass", "test_pass", "tool",
+                    "artifact", "logs", "content", "zip_url", "zip_notes", "follow_up_steps"
+                )
+                for key in merge_keys:
+                    value = parsed_payload.get(key)
+                    if value not in (None, "") and key not in final_payload:
+                        final_payload[key] = value
+                final_payload.setdefault("pending_final", False)
+                chunk_to_send = rebuild_chunk(chunk, final_payload, event_name)
+                parsed_payload = final_payload
+
+            yield chunk_to_send
+
+            if parsed_payload and parsed_payload.get("status") == "done":
+                if parsed_payload.get("pending_final"):
+                    continue
+                try:
+                    hub.close(str(task_id))
+                except Exception:
+                    pass
+                try:
+                    sse_terminated_total.labels(reason="status").inc()
+                except Exception:
+                    pass
+                logger.info("sse_close", extra={"reason":"status","task_id":str(task_id)})
+                break
+            if parsed_payload and parsed_payload.get("status") in {"error", "canceled"}:
                 try:
                     hub.close(str(task_id))
                 except Exception:
@@ -177,25 +528,10 @@ async def stream_task(task_id: uuid.UUID):
             if now - last_check >= 2.0:
                 last_check = now
                 try:
-                    # Lazy import so startup is safe even if artifacts module is absent
-                    from .artifacts import _resolve_root  # type: ignore
-                    try:
-                        pth = _resolve_root(str(task_id))
-                    except Exception:
-                        pth = None
-                    if pth and os.path.isdir(pth):
-                        payload = {"status": "done", "note": "artifacts-present"}
-                        try:
-                            res_path = Path(pth) / "result.json"
-                            if res_path.is_file():
-                                data = json.loads(res_path.read_text(encoding="utf-8"))
-                                for key in ("content", "zip_url", "artifact", "model", "tool", "logs"):
-                                    value = data.get(key)
-                                    if value not in (None, ""):
-                                        payload[key] = value
-                        except Exception:
-                            pass
-                        yield f'event: done\ndata: {json.dumps(payload)}\n\n'
+                    payload = await fetch_final_payload()
+                    if payload:
+                        chunk_payload = rebuild_chunk("event: done\n", payload, "done")
+                        yield chunk_payload
                         try:
                             hub.close(str(task_id))
                         except Exception:
@@ -210,31 +546,32 @@ async def stream_task(task_id: uuid.UUID):
                     # artifacts module not available or other error; ignore
                     pass
             # Poll DB for terminal status as a reliable fallback
-            if now - last_db_check >= 2.0:
+            if now - last_db_check >= db_poll_interval:
                 last_db_check = now
                 eng = await get_engine()
                 async with eng.begin() as conn:
                     row = await get_task(conn, task_id)
                 status = (row[1] if row else None)
                 if status in ("done", "error", "canceled"):
-                    payload = {"status": status, "note": "db-poll"}
-                    try:
-                        from .artifacts import _resolve_root  # type: ignore
-                        root = _resolve_root(str(task_id))
-                        res_path = Path(root) / "result.json"
-                        if res_path.is_file():
-                            data = json.loads(res_path.read_text(encoding="utf-8"))
-                            for key in ("content", "zip_url", "artifact", "model", "tool", "logs"):
-                                value = data.get(key)
-                                if value not in (None, ""):
-                                    payload[key] = value
-                    except Exception:
-                        pass
-                    yield f'event: done\ndata: {json.dumps(payload)}\n\n'
+                    if status == "done":
+                        payload = await wait_for_final_payload()
+                        if payload is None:
+                            await asyncio.sleep(final_retry_interval)
+                            continue
+                        chunk_payload = rebuild_chunk("event: done\n", payload, "done")
+                    else:
+                        payload = {"status": status, "note": "db-poll", "pending_final": False}
+                        chunk_payload = rebuild_chunk("event: done\n", payload, "done")
+                    yield chunk_payload
                     try:
                         hub.close(str(task_id))
                     except Exception:
                         pass
+                    try:
+                        sse_terminated_total.labels(reason="db").inc()
+                    except Exception:
+                        pass
+                    logger.info("sse_close", extra={"reason":"db","task_id":str(task_id)})
                     break
         
     return StreamingResponse(event_gen(), media_type="text/event-stream")

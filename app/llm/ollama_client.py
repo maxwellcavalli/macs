@@ -31,7 +31,12 @@ async def _pull(model: str) -> None:
             r = await cx.post(url, json=payload)
             r.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            detail = exc.response.text.strip()
+            detail = ""
+            try:
+                await exc.response.aread()
+                detail = exc.response.text.strip()
+            except Exception:
+                detail = ""
             msg = f"Ollama pull failed (status={exc.response.status_code})"
             if detail:
                 msg += f": {detail}"
@@ -97,7 +102,12 @@ async def generate_stream(
                         continue
                     yield obj
         except httpx.HTTPStatusError as exc:
-            detail = exc.response.text.strip()
+            detail = ""
+            try:
+                await exc.response.aread()
+                detail = exc.response.text.strip()
+            except Exception:
+                detail = ""
             msg = f"Ollama generate failed (status={exc.response.status_code})"
             if detail:
                 msg += f": {detail[:200]}"

@@ -1,4 +1,6 @@
 from __future__ import annotations
+from datetime import datetime
+
 from pydantic import BaseModel, Field, constr, field_validator, model_validator
 from typing import List, Optional, Literal, Dict, Any
 import uuid
@@ -84,6 +86,7 @@ class TaskV1(BaseTaskModel):
     input: TaskInput
     context: Optional[Dict[str, Any]] = None
     routing_hints: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
     prompt_template_version: Optional[str] = None
 
 class TaskV11(TaskV1):
@@ -106,3 +109,24 @@ class TaskStatus(BaseTaskModel):
     model_used: Optional[str] = None
     latency_ms: Optional[int] = None
     template_ver: Optional[str] = None
+
+
+class WorkspaceMemory(BaseModel):
+    id: uuid.UUID
+    task_id: Optional[uuid.UUID] = None
+    repo_path: Optional[str] = None
+    language: Optional[str] = None
+    mode: Optional[str] = None
+    status: Optional[str] = None
+    goal: Optional[str] = None
+    model: Optional[str] = None
+    summary: Optional[str] = None
+    artifact_rel: Optional[str] = None
+    zip_rel: Optional[str] = None
+    files: Dict[str, Any] = Field(default_factory=dict)
+    session_id: Optional[uuid.UUID] = None
+    created_at: datetime
+
+
+class WorkspaceMemorySearchResponse(BaseModel):
+    memories: List[WorkspaceMemory] = Field(default_factory=list)

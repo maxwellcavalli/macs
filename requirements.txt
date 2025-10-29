@@ -15,6 +15,7 @@ opentelemetry-api>=1.26.0
 opentelemetry-sdk>=1.26.0
 opentelemetry-instrumentation-fastapi>=0.47b0
 opentelemetry-instrumentation-asgi>=0.47b0
+python-multipart>=0.0.7
 psycopg[binary]>=3.2,<4
 psycopg-pool>=3.2,<4
 opentelemetry-sdk
