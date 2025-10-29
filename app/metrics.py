@@ -10,3 +10,13 @@ duel_rule_decisions_total = Counter("duel_rule_decisions_total","Duel decisions 
 
 http_latency = Histogram("http_request_duration_seconds","HTTP latencies",["route","method"])
 sse_terminated_total = Counter("sse_terminated_total","SSE terminations",["reason"])
+llm_first_token_latency = Histogram(
+    "llm_first_token_latency_seconds",
+    "Latency from request start until first token is received",
+    ["model"],
+)
+llm_generation_latency = Histogram(
+    "llm_generation_latency_seconds",
+    "Total time spent streaming model output per request",
+    ["model"],
+)

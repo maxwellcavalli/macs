@@ -5,14 +5,14 @@ services:
       context: /mnt/d/agente/multi_agent_code_system_v24
       dockerfile: Dockerfile
     command:
-      - uvicorn
-      - app.asgi:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8080"
-      - --lifespan
-      - "on"
+    - uvicorn
+    - app.asgi:app
+    - --host
+    - 0.0.0.0
+    - --port
+    - '8080'
+    - --lifespan
+    - 'on'
     depends_on:
       ollama:
         condition: service_started
@@ -26,62 +26,63 @@ services:
       DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_URL: http://ollama:11434
-      RL_BURST: "15"
-      RL_RPS: "5"
-      SSE_EARLY_EXIT_ACCEPT_ONLY: "1"
-      SSE_EARLY_EXIT_DIAGNOSTIC: "0"
-      SSE_EARLY_EXIT_ENABLED: "1"
+      RL_BURST: '15'
+      RL_RPS: '5'
+      SSE_EARLY_EXIT_ACCEPT_ONLY: '1'
+      SSE_EARLY_EXIT_DIAGNOSTIC: '0'
+      SSE_EARLY_EXIT_ENABLED: '1'
       SSE_EARLY_EXIT_PATH_HINTS: stream,events
-      SSE_EARLY_EXIT_REQUIRE_ID: "1"
-      SSE_DB_POLL_INTERVAL: "1.0"
-      FINAL_WAIT_SECONDS: "60.0"
-      FINAL_WAIT_INTERVAL: "0.2"
-      SSE_FINAL_WAIT_SECONDS: "120.0"
-      FORCE_DUEL: "1"
-      DUEL_TIMEOUT_SEC: "240"
-      CANDIDATE_TIMEOUT_SEC: "240"
-      WORKSPACE_MEMORY_ENABLED: "1"
-      WORKSPACE_MEMORY_EMBEDDINGS: "0"
+      SSE_EARLY_EXIT_REQUIRE_ID: '1'
+      SSE_DB_POLL_INTERVAL: '1.0'
+      FINAL_WAIT_SECONDS: '60.0'
+      FINAL_WAIT_INTERVAL: '0.2'
+      SSE_FINAL_WAIT_SECONDS: '120.0'
+      FORCE_DUEL: '0'
+      DUEL_TIMEOUT_SEC: '240'
+      CANDIDATE_TIMEOUT_SEC: '240'
+      WORKSPACE_MEMORY_ENABLED: '1'
+      WORKSPACE_MEMORY_EMBEDDINGS: '0'
+      OLLAMA_PARALLEL_SESSIONS_DEFAULT: '2'
     healthcheck:
       test:
-        - CMD-SHELL
-        - curl -fsS http://localhost:8080/health >/dev/null || exit 1
+      - CMD-SHELL
+      - curl -fsS http://localhost:8080/health >/dev/null || exit 1
       timeout: 5s
       interval: 10s
       retries: 20
     networks:
       default: null
     ports:
-      - mode: ingress
-        host_ip: 127.0.0.1
-        target: 8080
-        published: "8080"
-        protocol: tcp
+    - mode: ingress
+      host_ip: 127.0.0.1
+      target: 8080
+      published: '8080'
+      protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: bind
-        source: ./artifacts
-        target: /data/artifacts
-        bind:
-          create_host_path: true
-      - type: bind
-        source: ./workspace
-        target: /app/workspace
-        bind:
-          create_host_path: true
-      - type: bind
-        source: ./workspace/zips
-        target: /data/zips
-        bind:
-          create_host_path: true
+    - type: bind
+      source: ./artifacts
+      target: /data/artifacts
+      bind:
+        create_host_path: true
+    - type: bind
+      source: ./workspace
+      target: /app/workspace
+      bind:
+        create_host_path: true
+    - type: bind
+      source: ./workspace/zips
+      target: /data/zips
+      bind:
+        create_host_path: true
   flyway:
     command:
-      - -url=jdbc:postgresql://postgres:5432/agent
-      - -user=agent
-      - -password=agent
-      - -locations=filesystem:/flyway/sql
-      - -connectRetries=60
-      - migrate
+    - -url=jdbc:postgresql://postgres:5432/agent
+    - -user=agent
+    - -password=agent
+    - -locations=filesystem:/flyway/sql
+    - -connectRetries=60
+    - migrate
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,14 +90,14 @@ services:
     image: flyway/flyway:10.17.0
     networks:
       default: null
-    restart: "no"
+    restart: 'no'
     volumes:
-      - type: bind
-        source: /mnt/d/agente/multi_agent_code_system_v24/flyway/sql
-        target: /flyway/sql
-        read_only: true
-        bind:
-          create_host_path: true
+    - type: bind
+      source: /mnt/d/agente/multi_agent_code_system_v24/flyway/sql
+      target: /flyway/sql
+      read_only: true
+      bind:
+        create_host_path: true
   grafana:
     depends_on:
       grafana_provisioner:
@@ -109,11 +110,11 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_SECURITY_ADMIN_USER: admin
       GF_SERVER_ROOT_URL: http://localhost:33000
-      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_SIGN_UP: 'false'
     healthcheck:
       test:
-        - CMD-SHELL
-        - wget -qO- http://localhost:3000/api/health | grep -q healthy
+      - CMD-SHELL
+      - wget -qO- http://localhost:3000/api/health | grep -q healthy
       timeout: 5s
       interval: 15s
       retries: 20
@@ -121,59 +122,61 @@ services:
     networks:
       default: null
     ports:
-      - mode: ingress
-        host_ip: 127.0.0.1
-        target: 3000
-        published: "33000"
-        protocol: tcp
+    - mode: ingress
+      host_ip: 127.0.0.1
+      target: 3000
+      published: '33000'
+      protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: volume
-        source: grafana_data
-        target: /var/lib/grafana
-        volume: {}
-      - type: volume
-        source: grafana_provisioning
-        target: /etc/grafana/provisioning
-        read_only: true
-        volume: {}
+    - type: volume
+      source: grafana_data
+      target: /var/lib/grafana
+      volume: {}
+    - type: volume
+      source: grafana_provisioning
+      target: /etc/grafana/provisioning
+      read_only: true
+      volume: {}
   grafana_provisioner:
     command:
-      - set
-      - -e
-      - mkdir
-      - -p
-      - /provisioning/datasources
-      - cat
+    - set
+    - -e
+    - mkdir
+    - -p
+    - /provisioning/datasources
+    - cat
     entrypoint:
-      - /bin/sh
-      - -lc
+    - /bin/sh
+    - -lc
     image: busybox:1.36
     networks:
       default: null
-    restart: "no"
+    restart: 'no'
     volumes:
-      - type: volume
-        source: grafana_provisioning
-        target: /provisioning
-        volume: {}
+    - type: volume
+      source: grafana_provisioning
+      target: /provisioning
+      volume: {}
   ollama:
     deploy:
       resources:
         reservations:
           devices:
-            - capabilities:
-                - gpu
-              count: -1
+          - capabilities:
+            - gpu
+            count: -1
     environment:
       OLLAMA_KEEP_ALIVE: 24h
-      OLLAMA_DEBUG: "1"
+      OLLAMA_DEBUG: '1'
+      OLLAMA_PARALLEL_SESSIONS_DEFAULT: '2'
+      OLLAMA_PARALLEL_LIMIT: '2'
     gpus:
-      - count: -1
+    - count: -1
     healthcheck:
       test:
-        - CMD-SHELL
-        - curl -fsS http://localhost:11434/api/tags >/dev/null || exit 1
+      - CMD-SHELL
+      - curl -fsS http://localhost:11434/api/tags >/dev/null || exit 1
       timeout: 5s
       interval: 15s
       retries: 20
@@ -181,18 +184,18 @@ services:
     networks:
       default: null
     ports:
-      - mode: ingress
-        host_ip: 127.0.0.1
-        target: 11434
-        published: "11434"
-        protocol: tcp
+    - mode: ingress
+      host_ip: 127.0.0.1
+      target: 11434
+      published: '11434'
+      protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: bind
-        source: ./ollama/models
-        target: /root/.ollama
-        bind:
-          create_host_path: true
+    - type: bind
+      source: ./ollama/models
+      target: /root/.ollama
+      bind:
+        create_host_path: true
   postgres:
     environment:
       POSTGRES_DB: macs
@@ -200,8 +203,8 @@ services:
       POSTGRES_USER: macs
     healthcheck:
       test:
-        - CMD-SHELL
-        - pg_isready -U macs -d macs
+      - CMD-SHELL
+      - pg_isready -U macs -d macs
       timeout: 5s
       interval: 10s
       retries: 10
@@ -209,52 +212,52 @@ services:
     networks:
       default: null
     ports:
-      - mode: ingress
-        host_ip: 127.0.0.1
-        target: 5432
-        published: "55432"
-        protocol: tcp
+    - mode: ingress
+      host_ip: 127.0.0.1
+      target: 5432
+      published: '55432'
+      protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: volume
-        source: pgdata
-        target: /var/lib/postgresql/data
-        volume: {}
+    - type: volume
+      source: pgdata
+      target: /var/lib/postgresql/data
+      volume: {}
   prom_configgen:
     command:
-      - set
-      - -e
-      - mkdir
-      - -p
-      - /config
-      - cat
+    - set
+    - -e
+    - mkdir
+    - -p
+    - /config
+    - cat
     entrypoint:
-      - /bin/sh
-      - -lc
+    - /bin/sh
+    - -lc
     image: busybox:1.36
     networks:
       default: null
-    restart: "no"
+    restart: 'no'
     volumes:
-      - type: volume
-        source: promconfig
-        target: /config
-        volume: {}
+    - type: volume
+      source: promconfig
+      target: /config
+      volume: {}
   prometheus:
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --web.enable-lifecycle
+    - --config.file=/etc/prometheus/prometheus.yml
+    - --storage.tsdb.path=/prometheus
+    - --web.enable-lifecycle
     depends_on:
       prom_configgen:
         condition: service_completed_successfully
         required: true
     healthcheck:
       test:
-        - CMD
-        - wget
-        - -qO-
-        - http://localhost:9090/-/ready
+      - CMD
+      - wget
+      - -qO-
+      - http://localhost:9090/-/ready
       timeout: 5s
       interval: 10s
       retries: 20
@@ -262,29 +265,29 @@ services:
     networks:
       default: null
     ports:
-      - mode: ingress
-        host_ip: 127.0.0.1
-        target: 9090
-        published: "39090"
-        protocol: tcp
+    - mode: ingress
+      host_ip: 127.0.0.1
+      target: 9090
+      published: '39090'
+      protocol: tcp
     restart: unless-stopped
     volumes:
-      - type: volume
-        source: promdata
-        target: /prometheus
-        volume: {}
-      - type: volume
-        source: promconfig
-        target: /etc/prometheus
-        read_only: true
-        volume: {}
+    - type: volume
+      source: promdata
+      target: /prometheus
+      volume: {}
+    - type: volume
+      source: promconfig
+      target: /etc/prometheus
+      read_only: true
+      volume: {}
   runner:
     build:
       context: /mnt/d/agente/multi_agent_code_system_v24
       dockerfile: Dockerfile
     command:
-      - python
-      - tools/runner.py
+    - python
+    - tools/runner.py
     depends_on:
       ollama:
         condition: service_started
@@ -296,24 +299,24 @@ services:
       API_KEY: dev-4d8bd15f18a86658da5e4c2d323e51d5
       DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
       OLLAMA_URL: http://ollama:11434
-      FORCE_DUEL: "1"
-      DUEL_TIMEOUT_SEC: "240"
-      CANDIDATE_TIMEOUT_SEC: "240"
+      FORCE_DUEL: '1'
+      DUEL_TIMEOUT_SEC: '240'
+      CANDIDATE_TIMEOUT_SEC: '240'
     image: macs-api
     networks:
       default: null
     restart: unless-stopped
     volumes:
-      - type: bind
-        source: ./workspace
-        target: /app/workspace
-        bind:
-          create_host_path: true
-      - type: bind
-        source: ./workspace/zips
-        target: /data/zips
-        bind:
-          create_host_path: true
+    - type: bind
+      source: ./workspace
+      target: /app/workspace
+      bind:
+        create_host_path: true
+    - type: bind
+      source: ./workspace/zips
+      target: /data/zips
+      bind:
+        create_host_path: true
 networks:
   default:
     name: macs_default

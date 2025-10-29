@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 class BodySizeLimitASGI:
     """ASGI wrapper enforcing max HTTP request body size (default 10MiB)."""
     def __init__(self, app, max_bytes=None):
@@ -53,6 +54,9 @@ from .queue import JobQueue
 from .db import init_db
 from .logging_setup import setup_json_logging, get_logger
 from .middleware import RequestIDMiddleware
+from .registry import available_models
+from .llm.ollama_client import ensure_model, OllamaError
+from .settings import settings
 setup_json_logging()
 log = get_logger("bootstrap")
 app = FastAPI(title="MACS API")
@@ -80,6 +84,7 @@ async def _startup():
     except Exception as exc:
         log.error("db.init_failed", {"err": str(exc)})
         raise
+    await _ensure_primary_models()
     # create and start the queue
     jobq = JobQueue(hub)
     await jobq.start()
@@ -88,6 +93,7 @@ async def _startup():
     # also set module global for older call sites
     from . import api as api_module
     api_module.job_queue = jobq
+    asyncio.create_task(_warm_default_models())
     log.info("startup complete")
 @app.get("/")
 async def root():
@@ -309,6 +315,78 @@ try:
     app.include_router(_sse_router)
 except Exception:
     pass
+async def _warm_default_models() -> None:
+    """
+    Background warm-up that pre-ensures a small set of frequently-used models.
+    Executes best-effort and never blocks app startup.
+    """
+    await asyncio.sleep(0)  # yield to finish startup work
+    try:
+        preferred: set[str] = set()
+        if settings.chat_mode_default:
+            preferred.add(settings.chat_mode_default.strip())
+        warm_languages = [None, "docs", "planner", "java", "python"]
+        for lang in warm_languages:
+            try:
+                candidates = available_models(lang)
+            except Exception:
+                continue
+            for meta in candidates[:2]:
+                tag = (
+                    str(meta.get("tag") or "")
+                    or str(meta.get("model") or "")
+                ).strip()
+                if not tag:
+                    name = str(meta.get("name") or "").strip()
+                    size = str(meta.get("size") or "").strip()
+                    quant = str(meta.get("quant") or "").strip()
+                    if name:
+                        tag = name
+                        if size:
+                            tag = f"{tag}:{size}"
+                        if quant:
+                            if not tag.endswith(quant):
+                                tag = f"{tag}-{quant}"
+                if tag:
+                    preferred.add(tag)
+        if not preferred:
+            return
+        log.info("model.warmup.start", {"models": sorted(preferred)})
+        for tag in sorted(preferred):
+            if tag in _READY_MODELS:
+                continue
+            try:
+                await ensure_model(tag)
+                _READY_MODELS.add(tag)
+                log.info("model.warmup.ok", {"model": tag})
+            except OllamaError as exc:
+                log.warning("model.warmup.ollama_error", {"model": tag, "err": str(exc)})
+            except Exception as exc:
+                log.warning("model.warmup.failed", {"model": tag, "err": str(exc)})
+    except asyncio.CancelledError:
+        log.info("model.warmup.cancelled")
+        raise
+    except Exception as exc:
+        log.warning("model.warmup.unexpected_error", {"err": str(exc)})
+_READY_MODELS: set[str] = set()
+
+async def _ensure_primary_models() -> None:
+    """
+    Ensure the primary chat model is available before the queue starts,
+    so first requests do not block on an Ollama pull.
+    """
+    primary = (settings.chat_mode_default or "").strip()
+    if not primary:
+        return
+    try:
+        log.info("model.ensure.start", {"model": primary})
+        await ensure_model(primary)
+        _READY_MODELS.add(primary)
+        log.info("model.ensure.ready", {"model": primary})
+    except OllamaError as exc:
+        log.warning("model.ensure.ollama_error", {"model": primary, "err": str(exc)})
+    except Exception as exc:
+        log.warning("model.ensure.failed", {"model": primary, "err": str(exc)})
 def _resolve_pg_dsn() -> str | None:
     import os
     dsn = os.getenv("BANDIT_PG_DSN") or os.getenv("DATABASE_URL")

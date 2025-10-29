@@ -1,15 +1,16 @@
 from __future__ import annotations
 from .bandit_client import record as bandit_record
-import asyncio, time, json, textwrap, os, re, traceback
+import asyncio, time, json, textwrap, os, re, traceback, posixpath
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
 from fnmatch import fnmatch
 from .sse import StreamHub
-from .registry import available_models
+from .registry import available_models, get_mode_defaults
 from .db import get_engine, update_task_status
 from .metrics import (
     router_route_count, compile_pass_total, test_smoke_pass_total,
-    duel_selection_decisions_total, duel_rule_decisions_total
+    duel_selection_decisions_total, duel_rule_decisions_total,
+    llm_first_token_latency, llm_generation_latency,
 )
 from sqlalchemy import text
 from .llm.ollama_client import generate_stream, OllamaError
@@ -28,6 +29,7 @@ from .bandit_store import record_event as bandit_record_event
 from .artifacts import write_result
 from .zips import write_zip
 from .memory import record_completion
+from .settings import settings
 
 log = get_logger("queue")
 
@@ -123,7 +125,11 @@ ZIP_SKIP_SUFFIXES = tuple(
 )
 
 CODE_BLOCK_RE = re.compile(r"```([\w.+-]*)\n([\s\S]*?)```", re.MULTILINE)
-PATH_HINT_RE = re.compile(r"(?:^|\b)(?:file|path)\s*[:=]\s*([\w./\\-]+)", re.IGNORECASE)
+FILE_LINE_RE = re.compile(r"^\s*(?:[-*•+\d.)>\s]*)?(?:file|path)\s*[:=]\s*([^\s`]+)", re.IGNORECASE | re.MULTILINE)
+FILE_INLINE_RE = re.compile(r"(?:^|\b)(?:file|path)\s*[:=]\s*([^\s`]+)", re.IGNORECASE)
+
+REPO_PROMPT_FILE_LIMIT = int(os.getenv("REPO_PROMPT_FILE_LIMIT", "5"))
+REPO_PROMPT_SNIPPET_BYTES = int(os.getenv("REPO_PROMPT_SNIPPET_BYTES", "800"))
 
 def _sanitize_rel_path(path: str) -> str:
     path = path.strip().replace("\\", "/").lstrip("./")
@@ -131,36 +137,68 @@ def _sanitize_rel_path(path: str) -> str:
     return "/".join(parts) if parts else "output.txt"
 
 def _extract_files_from_content(text: str) -> Dict[str, str]:
+    """Parse `File:` markers paired with fenced blocks and return path→content."""
     files: Dict[str, str] = {}
     if not text:
         return files
+
+    def _clean_hint(line: str) -> str:
+        stripped = line.strip()
+        stripped = stripped.lstrip("-*•+0123456789.)> \t")
+        stripped = stripped.replace("**", "").replace("`", "")
+        return stripped
+
+    seen: set[str] = set()
+    blocks: List[Tuple[int, int, str]] = []
+    for match in CODE_BLOCK_RE.finditer(text):
+        start, end = match.span()
+        body = match.group(2)
+        blocks.append((start, end, body))
+
+    # Primary pass: associate standalone "File:" lines with the next fenced block.
+    remaining_blocks = blocks.copy()
+    for m in FILE_LINE_RE.finditer(text):
+        rel_path = _sanitize_rel_path(m.group(1))
+        if not rel_path or rel_path in seen:
+            continue
+        use_idx = None
+        for idx, (start, _, _) in enumerate(remaining_blocks):
+            if start >= m.end():
+                use_idx = idx
+                break
+        if use_idx is None:
+            break
+        _, _, body = remaining_blocks.pop(use_idx)
+        content = body.rstrip() + "\n"
+        files[rel_path] = content
+        seen.add(rel_path)
+
+    # Fallback: inspect fenced blocks for inline hints or nearby context not handled above.
     for match in CODE_BLOCK_RE.finditer(text):
         body = match.group(2)
-        lines = body.splitlines()
+        lines_in_block = body.splitlines()
         path = None
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        if lines:
-            first = lines[0].strip()
-            first = first.lstrip("*_`> ")
-            first = first.replace("**", "").replace("`", "")
-            m = PATH_HINT_RE.match(first)
-            if m:
-                path = _sanitize_rel_path(m.group(1))
-                lines = lines[1:]
+        while lines_in_block and not lines_in_block[0].strip():
+            lines_in_block.pop(0)
+        if lines_in_block:
+            first = _clean_hint(lines_in_block[0])
+            inline = FILE_INLINE_RE.match(first)
+            if inline:
+                path = _sanitize_rel_path(inline.group(1))
+                lines_in_block = lines_in_block[1:]
         if not path:
             context = text[:match.start()].splitlines()
-            for line in reversed(context[-4:]):
-                line_clean = line.strip().lstrip("*_`> ")
-                line_clean = line_clean.replace("**", "").replace("`", "")
-                m = PATH_HINT_RE.search(line_clean)
-                if m:
-                    path = _sanitize_rel_path(m.group(1))
+            for line in reversed(context[-8:]):
+                candidate = _clean_hint(line)
+                ctx_match = FILE_INLINE_RE.search(candidate)
+                if ctx_match:
+                    path = _sanitize_rel_path(ctx_match.group(1))
                     break
-        if not path:
+        if not path or path in seen:
             continue
-        content = "\n".join(lines).rstrip() + "\n"
+        content = "\n".join(lines_in_block).rstrip() + "\n"
         files[path] = content
+        seen.add(path)
     return files
 
 def _format_model_name(m: Dict[str, Any]) -> str:
@@ -177,8 +215,20 @@ def _format_model_name(m: Dict[str, Any]) -> str:
     quant = m.get("quant", "")
     return f"{m.get('name')}:{size_tag}-{quant}".strip("-")
 
-def _order_models_for_mode(mode: str, models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    prefs = MODE_PREFERENCES.get(mode, [])
+def _order_models_for_mode(mode: str, models: List[Dict[str, Any]], language: Optional[str] = None) -> List[Dict[str, Any]]:
+    preferred = get_mode_defaults(mode, language)
+    if mode == "chat":
+        chat_default = settings.chat_mode_default
+        if chat_default:
+            chat_default = chat_default.strip()
+            if chat_default:
+                tag = chat_default
+                if tag not in preferred:
+                    preferred = [tag] + preferred
+                else:
+                    preferred = [tag] + [p for p in preferred if p != tag]
+    fallback = MODE_PREFERENCES.get(mode, [])
+    prefs = preferred + [p for p in fallback if p not in preferred]
     index = {tag: idx for idx, tag in enumerate(prefs)}
     def sort_key(m: Dict[str, Any]) -> Tuple[int, int]:
         tag = _format_model_name(m)
@@ -231,10 +281,11 @@ def _read_text_file(path: Path) -> str | None:
     except Exception:
         return None
 
-def _collect_repo_snapshot(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
+def _collect_repo_snapshot(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[str], Optional[str], Optional[Path]]:
     notes: List[str] = []
     if not ZIP_INCLUDE_REPO:
-        return {}, notes
+        log.debug("zip.repo.snapshot.skip", {"reason": "disabled"})
+        return {}, notes, None, None
     repo = (job.get("input") or {}).get("repo") or {}
     repo_path_raw = repo.get("path")
     defaulted_path = False
@@ -245,7 +296,8 @@ def _collect_repo_snapshot(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[st
     repo_dir, ok = resolve_safe_path(rel if rel != "." else ".")
     if not ok or not repo_dir.exists():
         notes.append(f"Repo snapshot skipped (path '{rel}' not accessible).")
-        return {}, notes
+        log.warning("zip.repo.snapshot.skip", {"reason": "path_inaccessible", "path": rel})
+        return {}, notes, None, None
     includes = [str(p).strip() for p in (repo.get("include") or []) if str(p).strip()]
     excludes = [str(p).strip() for p in (repo.get("exclude") or []) if str(p).strip()]
     base_parts: List[str] = []
@@ -286,12 +338,105 @@ def _collect_repo_snapshot(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[st
             file_count += 1
     except Exception as exc:
         notes.append(f"Repo snapshot error: {exc}")
+        log.exception("zip.repo.snapshot.error", extra={"path": rel, "error": str(exc)})
     if collected:
         if not notes:
             notes.append(f"Repo snapshot captured {file_count} files ({total_bytes} bytes).")
         if defaulted_path:
             notes.append("Repo snapshot defaulted to workspace root (no repo.path provided).")
-    return collected, notes
+        log.info(
+            "zip.repo.snapshot.success",
+            {
+                "path": rel,
+                "files": file_count,
+                "bytes": total_bytes,
+                "prefix": base_prefix or "",
+                "defaulted_path": defaulted_path,
+            },
+        )
+    else:
+        log.debug("zip.repo.snapshot.empty", {"path": rel})
+    return collected, notes, base_prefix or None, repo_dir
+
+def _rebase_generated_files(
+    generated: Dict[str, str],
+    repo_files: Dict[str, str],
+    prefix_hint: Optional[str] = None,
+) -> Tuple[Dict[str, str], Optional[str]]:
+    if not generated:
+        return generated, prefix_hint
+    prefix = prefix_hint or ""
+    if not prefix:
+        keys = [k for k in repo_files.keys() if k]
+        if not keys:
+            log.debug(
+                "zip.rebase.skip",
+                {"reason": "no_repo_files", "generated_count": len(generated)},
+            )
+            return generated, None
+        try:
+            prefix = posixpath.commonpath(keys)
+        except (ValueError, OSError):
+            prefix = ""
+    if not prefix or prefix == ".":
+        log.debug(
+            "zip.rebase.skip",
+            {"reason": "no_prefix", "generated_count": len(generated)},
+        )
+        return generated, None
+    try:
+        prefix_norm = prefix.rstrip("/")
+    except Exception:
+        prefix_norm = prefix
+    rebased: Dict[str, str] = {}
+    suffix = f"{prefix_norm}/"
+    for rel, data in generated.items():
+        if rel.startswith(prefix_norm) or rel.startswith(suffix):
+            target = rel
+        else:
+            target = posixpath.join(prefix_norm, rel)
+        rebased[target] = data
+    log.info(
+        "zip.rebase.applied",
+        {
+            "prefix": prefix_norm,
+            "original_paths": list(generated.keys()),
+            "rebased_paths": list(rebased.keys()),
+        },
+    )
+    return rebased, prefix_norm
+
+def _collect_repo_prompt_snippets(repo: Dict[str, Any]) -> List[Tuple[str, str]]:
+    rel = str((repo or {}).get("path") or "").strip()
+    if not rel:
+        return []
+    normalized = _normalize_repo_rel(rel)
+    root, ok = resolve_safe_path(normalized if normalized != "." else ".")
+    if not ok or not root.exists():
+        return []
+    snippets: List[Tuple[str, str]] = []
+    try:
+        for path in sorted(root.rglob("*")):
+            if len(snippets) >= REPO_PROMPT_FILE_LIMIT:
+                break
+            if not path.is_file():
+                continue
+            size = path.stat().st_size
+            if size > ZIP_MAX_FILE_BYTES:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    text = path.read_text(encoding="latin-1")
+                except Exception:
+                    continue
+            snippet = text[:REPO_PROMPT_SNIPPET_BYTES]
+            rel_path = path.relative_to(root).as_posix()
+            snippets.append((rel_path, snippet))
+    except Exception:
+        return snippets
+    return snippets
 
 def _collect_memory_context_files(job: Dict[str, Any]) -> Tuple[Dict[str, str], List[str]]:
     files: Dict[str, str] = {}
@@ -813,18 +958,47 @@ def _build_prompt(job: dict) -> str:
             if model:
                 header += f" [model: {model}]"
             snippet_lines.append(header)
+            files_payload = entry.get("files") or {}
+            file_map = {}
+            if isinstance(files_payload, dict):
+                maybe_files = files_payload.get("files")
+                if isinstance(maybe_files, dict):
+                    file_map = {str(k): str(v) for k, v in maybe_files.items()}
+            artifact_preview = str(files_payload.get("artifact_preview") or "")
+            artifact_rel = str(files_payload.get("artifact") or "")
+
             if summary:
                 trimmed = summary[:800]
                 snippet_lines.append(trimmed)
+            if artifact_rel and artifact_preview:
+                snippet_lines.append(f"Artifact ({artifact_rel}):\n{artifact_preview[:800]}")
+            if file_map:
+                snippet_lines.append("Files excerpt:")
+                for rel, content in list(file_map.items())[:5]:
+                    snippet_lines.append(f"- {rel}:\n{content[:800]}")
             memory_snippets.append("\n".join(snippet_lines))
-        memory_section = f"Relevant prior completions:\n{chr(10).join(memory_snippets)}\n\n" if memory_snippets else ""
+        memory_section = ""
+        if memory_snippets:
+            memory_section = (
+                "User-provided code/context (from uploads and prior runs):\n"
+                f"{chr(10).join(memory_snippets)}\n\n"
+                "Always treat these snippets as the authoritative reference for this request.\n\n"
+            )
+        repo_section_prompt = ""
+        repo_spec = inp.get("repo") or {}
+        repo_snippets = _collect_repo_prompt_snippets(repo_spec)
+        if repo_snippets:
+            lines: List[str] = ["Uploaded repository snippets:"]
+            for rel, snippet in repo_snippets:
+                lines.append(f"- {rel}:\n{snippet}")
+            repo_section_prompt = "\n".join(lines) + "\n\n"
         return textwrap.dedent(f"""
         You are a friendly engineering assistant. Answer in natural language, keep responses concise, and avoid writing source code unless the user clearly asks for it.
         When the user requests code, files, scaffolds, or archives, emit the actual file contents. For every file:
           - Add a line 'File: relative/path.ext' (relative to project root).
           - Follow with a fenced code block containing the file body.
           - Do NOT reference external download links or say 'see attached zip'; provide the real content inline instead.
-        {memory_section}{history_section}Latest user message: {goal}
+        {memory_section}{repo_section_prompt}{history_section}Latest user message: {goal}
         """).strip()
 
     if mode == "docs":
@@ -947,6 +1121,17 @@ class JobQueue:
         self._task = None
         # Track inflight tasks for cancel
         self._inflight: Dict[str, List[asyncio.Task]] = {}
+        self._start_times: Dict[str, float] = {}
+
+    async def _publish_status(self, task_id: str, message: str, stage: Optional[str] = None, include_elapsed: bool = True) -> None:
+        payload = {"status": "running", "message": message}
+        if include_elapsed:
+            started = self._start_times.get(task_id)
+            if started:
+                payload["elapsed_seconds"] = round(max(0.0, time.time() - started), 1)
+        if stage:
+            payload["stage"] = stage
+        await self.hub.publish(task_id, json.dumps(payload))
 
     async def start(self):
         if self._task is None:
@@ -962,6 +1147,7 @@ class JobQueue:
                 t.cancel()
         await self.hub.publish(task_id, json.dumps({"status":"canceled"}))
         log.info("task.canceled", {"id": task_id, "canceled_children": len(tasks)})
+        self._start_times.pop(task_id, None)
 
     async def _write_primary(self, rel_path: str, candidate_dir: Path, generated: str) -> Path:
         rel_path = rel_path.lstrip("/").replace("..","_")
@@ -1031,11 +1217,43 @@ class JobQueue:
         prompt = _build_prompt(job)
         ctx = int(candidate.get("ctx_size", 8192) or 8192)
         buf_parts: List[str] = []
+        first_token_at: Optional[float] = None
+        chunk_count = 0
         try:
             async for chunk in generate_stream(model_str, prompt, num_ctx=ctx, temperature=0.2):
                 if "response" in chunk and not chunk.get("done"):
-                    buf_parts.append(chunk["response"])
+                    text_piece = chunk.get("response") or ""
+                    if text_piece:
+                        if first_token_at is None:
+                            first_token_at = time.time()
+                            try:
+                                llm_first_token_latency.labels(model=model_str).observe(first_token_at - t0)
+                            except Exception:
+                                pass
+                        chunk_count += 1
+                    buf_parts.append(text_piece)
             generated = "".join(buf_parts).strip()
+            total_duration = time.time() - t0
+            try:
+                llm_generation_latency.labels(model=model_str).observe(total_duration)
+            except Exception:
+                pass
+            if first_token_at is not None:
+                log.info(
+                    "candidate.stream.complete",
+                    {
+                        "task_id": task_id,
+                        "model": model_str,
+                        "first_token_ms": int((first_token_at - t0) * 1000),
+                        "total_ms": int(total_duration * 1000),
+                        "chunks": chunk_count,
+                    },
+                )
+            else:
+                log.warning(
+                    "candidate.stream.empty",
+                    {"task_id": task_id, "model": model_str, "total_ms": int(total_duration * 1000)},
+                )
         except OllamaError as e:
             generated = f"// ollama error: {e}\n"
         except asyncio.CancelledError:
@@ -1045,6 +1263,132 @@ class JobQueue:
 
         # sanitize + write
         raw_output = generated
+
+        if mode in {"chat", "docs", "planner"}:
+            latency_ms = int((time.time() - t0) * 1000)
+            content = raw_output.strip()
+            zip_path = None
+            zip_url = None
+            zip_notes: List[str] = []
+            generated_files = _extract_files_from_content(raw_output)
+            sanitized_generated: Dict[str, str] = {}
+            for rel, data in generated_files.items():
+                body = data if data.endswith("\n") else data + "\n"
+                if rel.lower().endswith(".java"):
+                    body = _sanitize_java(body, rel)
+                sanitized_generated[rel] = body
+
+            try:
+                repo_files, repo_notes, repo_prefix_hint, repo_root_path = _collect_repo_snapshot(job)
+            except Exception:
+                repo_files, repo_notes, repo_prefix_hint, repo_root_path = {}, [], None, None
+                log.exception(
+                    "zip.repo.snapshot.unhandled_error",
+                    {"task_id": task_id, "model": model_str},
+                )
+            zip_notes.extend(repo_notes)
+            repo_files = {k: v for k, v in repo_files.items() if isinstance(v, str)}
+            result_map: Dict[str, str] = {}
+            if repo_files:
+                result_map.update(repo_files)
+                zip_notes.append("Included files from uploaded archive.")
+                log.debug(
+                    "zip.repo.snapshot.loaded",
+                    {"task_id": task_id, "count": len(repo_files), "prefix": repo_prefix_hint or ""},
+                )
+            if sanitized_generated:
+                applied_to_repo = {}
+                if repo_root_path:
+                    for rel, body in sanitized_generated.items():
+                        rel_safe = _sanitize_rel_path(rel)
+                        try:
+                            target_path = repo_root_path / rel_safe
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            target_path.write_text(body, encoding="utf-8")
+                            applied_to_repo[rel_safe] = body
+                        except Exception as exc:
+                            log.error(
+                                "zip.repo.apply_failed",
+                                {
+                                    "task_id": task_id,
+                                    "path": rel_safe,
+                                    "error": str(exc),
+                                },
+                            )
+                    if applied_to_repo:
+                        repo_key_prefix = (repo_prefix_hint or "").rstrip("/")
+                        for rel_safe, body in applied_to_repo.items():
+                            if repo_key_prefix:
+                                repo_key = f"{repo_key_prefix}/{rel_safe}"
+                            else:
+                                repo_key = rel_safe
+                            repo_files[repo_key] = body
+                        log.info(
+                            "zip.repo.apply_success",
+                            {
+                                "task_id": task_id,
+                                "count": len(applied_to_repo),
+                                "prefix": repo_key_prefix,
+                            },
+                        )
+                else:
+                    log.warning(
+                        "zip.repo.apply_skipped",
+                        {"task_id": task_id, "reason": "no_repo_root"},
+                    )
+                rebased_generated, repo_prefix = _rebase_generated_files(
+                    {k: v for k, v in sanitized_generated.items() if isinstance(v, str)},
+                    repo_files,
+                    repo_prefix_hint,
+                )
+                result_map.update(rebased_generated)
+                if repo_prefix:
+                    zip_notes.append(f"Included model files under {repo_prefix}/.")
+                else:
+                    zip_notes.append("Included files emitted by the model response.")
+                log.debug(
+                    "zip.model.output",
+                    {
+                        "task_id": task_id,
+                        "original_count": len(sanitized_generated),
+                        "rebased_count": len(rebased_generated),
+                        "repo_prefix": repo_prefix or "",
+                    },
+                )
+            else:
+                log.debug("zip.model.output.empty", {"task_id": task_id})
+            if content:
+                response_body = content if content.endswith("\n") else content + "\n"
+                result_map.setdefault("response.md", response_body)
+                zip_notes.append("Included response.md with model reply.")
+            if result_map:
+                try:
+                    zip_file = write_zip(str(task_id), result_map, default_name="response.md")
+                    zip_path = str(zip_file)
+                    zip_url = f"/zips/{zip_file.name}"
+                except Exception as exc:
+                    zip_notes.append(f"Zip assembly failed: {exc}")
+            return {
+                "model": model_str,
+                "success": bool(content or result_map),
+                "latency_ms": latency_ms,
+                "speed_rank": int(candidate.get("speed_rank", 999)),
+                "human_score": 0,
+                "compile_pass": False,
+                "test_pass": False,
+                "tool": mode,
+                "logs": {},
+                "artifact": "",
+                "content": content,
+                "zip_path": zip_path,
+                "zip_url": zip_url,
+                "files": result_map,
+                "zip_notes": zip_notes,
+                "pending_final": False,
+                "missing_components": [],
+                "follow_up_steps": [],
+            }
+
         if mode == "code" and rel_primary.endswith(".java"):
             to_write = _sanitize_java(raw_output, rel_primary)
         else:
@@ -1098,6 +1442,10 @@ class JobQueue:
                     if missing_components:
                         component_notes.append("Placeholders could not satisfy: " + ", ".join(missing_components))
                         follow_up_steps.append("Some components still missing after placeholder pass: " + ", ".join(missing_components))
+                    await self._publish_status(task_id, f"Inserted placeholders for missing components—review before use.", stage="followup")
+
+        if mode == "code":
+            await self._publish_status(task_id, f"Assembling workspace files from {model_str}…", stage="assembling")
 
         if components:
             primary_rel = next((rel for rel in files_map if rel.lower().endswith((".java", ".py", ".ts", ".js", ".cs", ".go"))), None)
@@ -1180,6 +1528,7 @@ class JobQueue:
         tool_used = "maven"
 
         if mode == "code":
+            await self._publish_status(task_id, "Running quick checks…", stage="validating")
             if primary_path.suffix.lower() == ".java":
                 c, t, o, e, tool = await build_and_test_java(dir_path)
                 compile_pass, test_pass, out_tail, err_tail, tool_used = c, t, o, e, tool
@@ -1209,6 +1558,7 @@ class JobQueue:
             zip_notes.append("Follow-up:")
             zip_notes.extend(f"- {step}" for step in follow_up_steps)
         try:
+            await self._publish_status(task_id, f"Packaging artifacts from {model_str}…", stage="packaging")
             zip_files: Dict[str, str] = {}
             for path in merge_root.rglob("*"):
                 if not path.is_file():
@@ -1234,6 +1584,7 @@ class JobQueue:
         has_primary = bool(content.strip())
         has_zip = bool(zip_url)
         has_artifact = bool(str(primary_path))
+        await self._publish_status(task_id, "Finalizing response…", stage="finalizing")
         success_flag = bool(test_pass or compile_pass) and not missing_components
         __RET__ = {
             "model": model_str,
@@ -1320,17 +1671,32 @@ class JobQueue:
         eng = await get_engine()
         while True:
             job = await self.queue.get()
-            id = job["id"]
-            set_task_id(str(id))
-            language = job["input"]["language"]
+            id = job['id']
+            task_id = str(id)
+            set_task_id(task_id)
+            input_block = job.get('input') or {}
+            language = str(input_block.get('language') or 'general').lower()
             mode = _infer_mode(job)
             job["_mode"] = mode
-            self._inflight[str(id)] = []
-            await self.hub.publish(str(id), json.dumps({"status":"running", "mode": mode}))
+            meta_for_log = job.get("metadata") or {}
+            mem_entries = meta_for_log.get("memory_context") or []
+            log.info(
+                "job.start",
+                {
+                    "task_id": task_id,
+                    "mode": mode,
+                    "memory_count": len(mem_entries),
+                    "has_repo": bool((input_block.get("repo") or {}).get("path")),
+                },
+            )
+            self._inflight[task_id] = []
+            self._start_times[task_id] = time.time()
+            await self.hub.publish(task_id, json.dumps({"status":"running", "mode": mode}))
+            await self._publish_status(task_id, "Thinking through your request…", stage="thinking")
 
             if mode == "clarify":
                 question = _clarify_message(job)
-                self._write_artifact_safely(str(id), {
+                self._write_artifact_safely(task_id, {
                     "status": "done",
                     "mode": "clarify",
                     "model": "router-clarify",
@@ -1341,7 +1707,7 @@ class JobQueue:
                         await update_task_status(conn, id, "done", model_used="router-clarify", latency_ms=0)
                 except Exception:
                     pass
-                await self.hub.publish(str(id), json.dumps({
+                await self.hub.publish(task_id, json.dumps({
                     "status": "done",
                     "mode": "clarify",
                     "message": question,
@@ -1349,7 +1715,8 @@ class JobQueue:
                     "model": "router-clarify"
                 }))
                 self.queue.task_done()
-                self._inflight.pop(str(id), None)
+                self._inflight.pop(task_id, None)
+                self._start_times.pop(task_id, None)
                 continue
 
             feats = extract_features(job)
@@ -1369,26 +1736,29 @@ class JobQueue:
                 language_hint = "planner"
 
             force_duel = bool((job.get("metadata") or {}).get("force_duel")) or FORCE_DUEL
+            if mode == "chat":
+                force_duel = False
             if force_duel:
                 is_duel = True
 
             try:
                 if not is_duel:
                     base_models = available_models(language_hint)
-                    base = _order_models_for_mode(mode, base_models)
+                    base = _order_models_for_mode(mode, base_models, language)
                     async with eng.connect() as conn:
                         ordered = await rank_models(conn, base, fh)
                     m = ordered[0] if ordered else None
                     if not m:
                         raise RuntimeError("no available models")
-                    t = asyncio.create_task(self._run_candidate(job, m, str(id)))
-                    self._inflight[str(id)].append(t)
+                    await self._publish_status(task_id, f"Generating answer with {_format_model_name(m)}…", stage="generating")
+                    t = asyncio.create_task(self._run_candidate(job, m, task_id))
+                    self._inflight[task_id].append(t)
                     res = await t
                     reward = 1.0 if res.get("test_pass") else (0.5 if res.get("compile_pass") else 0.0)
 
                     # bandit: log real single-run reward
                     try:
-                        bandit_record_event(res.get("model") or "unknown", float(reward), {"src":"queue","task_id": str(id),"mode":"single"})
+                        bandit_record_event(res.get("model") or "unknown", float(reward), {"src":"queue","task_id": task_id,"mode":"single"})
                     except Exception:
                         pass
 
@@ -1397,7 +1767,7 @@ class JobQueue:
                         await upsert_stat(conn, res["model"], fh, reward)
 
                     # artifact for SSE completion
-                    self._write_artifact_safely(str(id), {
+                    self._write_artifact_safely(task_id, {
                         "status":"done","mode":"single",
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
@@ -1405,9 +1775,10 @@ class JobQueue:
                         "content": res.get("content"),
                         "zip_url": res.get("zip_url"),
                         "zip_notes": res.get("zip_notes"),
+                        "follow_up_steps": res.get("follow_up_steps"),
                     })
 
-                    await self.hub.publish(str(id), json.dumps({
+                    await self.hub.publish(task_id, json.dumps({
                         "status":"done",
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
@@ -1415,6 +1786,7 @@ class JobQueue:
                         "content": res.get("content"),
                         "zip_url": res.get("zip_url"),
                         "zip_notes": res.get("zip_notes"),
+                        "follow_up_steps": res.get("follow_up_steps"),
                         "pending_final": bool(res.get("pending_final")),
                     }))
                     try:
@@ -1422,12 +1794,12 @@ class JobQueue:
                     except Exception:
                         pass
                     try:
-                        await record_completion(str(id), job, res)
+                        await record_completion(task_id, job, res)
                     except Exception:
                         pass
                 else:
                     cand_names: List[str] = duel_cfg.get("duel_candidates") or []
-                    reg_models = _order_models_for_mode(mode, available_models(language_hint))
+                    reg_models = _order_models_for_mode(mode, available_models(language_hint), language)
                     name_map = { _format_model_name(m): m for m in reg_models }
                     candidates = [name_map[s] for s in cand_names if s in name_map] if cand_names else reg_models[:2]
                     async with eng.connect() as conn:
@@ -1435,8 +1807,9 @@ class JobQueue:
                     if len(ordered) < 2:
                         # fallback to single
                         m = ordered[0] if ordered else (reg_models[0] if reg_models else None)
-                        t = asyncio.create_task(self._run_candidate(job, m, str(id)))
-                        self._inflight[str(id)].append(t)
+                        await self._publish_status(task_id, f"Generating answer with {_format_model_name(m)}…", stage="generating")
+                        t = asyncio.create_task(self._run_candidate(job, m, task_id))
+                        self._inflight[task_id].append(t)
                         res = await t
                         reward = 1.0 if res.get("test_pass") else (0.5 if res.get("compile_pass") else 0.0)
                         async with eng.begin() as conn:
@@ -1444,7 +1817,7 @@ class JobQueue:
                             await upsert_stat(conn, res["model"], fh, reward)
 
                         # artifact
-                        self._write_artifact_safely(str(id), {
+                        self._write_artifact_safely(task_id, {
                             "status":"done","mode":"single",
                             "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                             "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
@@ -1452,9 +1825,10 @@ class JobQueue:
                             "content": res.get("content"),
                             "zip_url": res.get("zip_url"),
                             "zip_notes": res.get("zip_notes"),
+                            "follow_up_steps": res.get("follow_up_steps"),
                         })
 
-                        await self.hub.publish(str(id), json.dumps({
+                        await self.hub.publish(task_id, json.dumps({
                             "status":"done",
                             "model":res.get("model"),
                             "latency_ms":res.get("latency_ms"),
@@ -1466,6 +1840,7 @@ class JobQueue:
                             "content": res.get("content"),
                             "zip_url": res.get("zip_url"),
                             "zip_notes": res.get("zip_notes"),
+                            "follow_up_steps": res.get("follow_up_steps"),
                             "pending_final": bool(res.get("pending_final")),
                         }))
                         try:
@@ -1473,29 +1848,31 @@ class JobQueue:
                         except Exception:
                             pass
                         try:
-                            await record_completion(str(id), job, res)
+                            await record_completion(task_id, job, res)
                         except Exception:
                             pass
                         self.queue.task_done()
-                        self._inflight.pop(str(id), None)
+                        self._inflight.pop(task_id, None)
+                        self._start_times.pop(task_id, None)
                         continue
 
                     a_meta, b_meta = ordered[0], ordered[1]
                     a_name, b_name = _format_model_name(a_meta), _format_model_name(b_meta)
                     router_route_count.labels(model=a_name, language=language).inc()
                     router_route_count.labels(model=b_name, language=language).inc()
-                    await self.hub.publish(str(id), json.dumps({"phase":"duel","candidate":a_name,"status":"running"}))
-                    await self.hub.publish(str(id), json.dumps({"phase":"duel","candidate":b_name,"status":"running"}))
+                    await self.hub.publish(task_id, json.dumps({"phase":"duel","candidate":a_name,"status":"running","message":f"Pairing with {a_name}…"}))
+                    await self.hub.publish(task_id, json.dumps({"phase":"duel","candidate":b_name,"status":"running","message":f"Pairing with {b_name}…"}))
 
                     # run both with a global duel timeout
-                    ta = asyncio.create_task(self._run_candidate(job, a_meta, str(id)))
-                    tb = asyncio.create_task(self._run_candidate(job, b_meta, str(id)))
-                    self._inflight[str(id)].extend([ta, tb])
+                    await self._publish_status(task_id, "Generating duel candidates…", stage="generating")
+                    ta = asyncio.create_task(self._run_candidate(job, a_meta, task_id))
+                    tb = asyncio.create_task(self._run_candidate(job, b_meta, task_id))
+                    self._inflight[task_id].extend([ta, tb])
 
                     try:
                         a_res, b_res = await asyncio.wait_for(asyncio.gather(ta, tb), timeout=DUEL_TIMEOUT_SEC)
                     except asyncio.TimeoutError:
-                        log.warning("duel.timeout", {"task_id": str(id), "timeout_sec": DUEL_TIMEOUT_SEC})
+                        log.warning("duel.timeout", {"task_id": task_id, "timeout_sec": DUEL_TIMEOUT_SEC})
                         # cancel any still-running tasks
                         for t in (ta, tb):
                             if not t.done(): t.cancel()
@@ -1509,7 +1886,9 @@ class JobQueue:
                                              "compile_pass": False, "test_pass": False, "tool": "timeout", "logs": {"build_stdout_tail":"","build_stderr_tail":"duel timed out"}, "artifact": ""})
                         a_res, b_res = done
 
-                    await self.hub.publish(str(id), json.dumps({
+                    await self._publish_status(task_id, f"Comparing {a_name} vs {b_name}…", stage="evaluating")
+
+                    await self.hub.publish(task_id, json.dumps({
                         "phase":"duel","candidate":a_res["model"],"status":"done",
                         "metrics":{"success":a_res["success"],"latency_ms":a_res["latency_ms"],"compile_pass":a_res["compile_pass"],"test_pass":a_res["test_pass"]},
                         "tool":a_res["tool"], "artifact":a_res["artifact"], "logs":a_res["logs"],
@@ -1518,7 +1897,7 @@ class JobQueue:
                         "zip_notes": a_res.get("zip_notes"),
                         "pending_final": bool(a_res.get("pending_final")),
                     }))
-                    await self.hub.publish(str(id), json.dumps({
+                    await self.hub.publish(task_id, json.dumps({
                         "phase":"duel","candidate":b_res["model"],"status":"done",
                         "metrics":{"success":b_res["success"],"latency_ms":b_res["latency_ms"],"compile_pass":b_res["compile_pass"],"test_pass":b_res["test_pass"]},
                         "tool":b_res["tool"], "artifact":b_res["artifact"], "logs":b_res["logs"],
@@ -1549,8 +1928,8 @@ class JobQueue:
 
                     # bandit: log duel rewards (winner & loser)
                     try:
-                        bandit_record_event(winner.get("model") or "unknown", float(reward_w), {"src":"queue","task_id": str(id),"mode":"duel","role":"winner","opponent": (loser.get("model") or "unknown")})
-                        bandit_record_event(loser.get("model") or "unknown", float(reward_l), {"src":"queue","task_id": str(id),"mode":"duel","role":"loser","opponent": (winner.get("model") or "unknown")})
+                        bandit_record_event(winner.get("model") or "unknown", float(reward_w), {"src":"queue","task_id": task_id,"mode":"duel","role":"winner","opponent": (loser.get("model") or "unknown")})
+                        bandit_record_event(loser.get("model") or "unknown", float(reward_l), {"src":"queue","task_id": task_id,"mode":"duel","role":"loser","opponent": (winner.get("model") or "unknown")})
                     except Exception:
                         pass
 
@@ -1558,17 +1937,17 @@ class JobQueue:
                         await update_task_status(conn, id, "done", model_used=winner["model"], latency_ms=min(a_res["latency_ms"], b_res["latency_ms"]))
                         await conn.execute(text("""INSERT INTO rewards (id, task_id, model, success, latency_ms, human_score)
                                                    VALUES (gen_random_uuid(), :tid, :m1, :s1, :l1, NULL)"""),
-                                           dict(tid=str(id), m1=winner["model"], s1=bool(winner["success"]), l1=int(winner["latency_ms"])))
+                                           dict(tid=task_id, m1=winner["model"], s1=bool(winner["success"]), l1=int(winner["latency_ms"])))
                         await conn.execute(text("""INSERT INTO rewards (id, task_id, model, success, latency_ms, human_score)
                                                    VALUES (gen_random_uuid(), :tid, :m2, :s2, :l2, NULL)"""),
-                                           dict(tid=str(id), m2=loser["model"], s2=bool(loser["success"]), l2=int(loser["latency_ms"])))
+                                           dict(tid=task_id, m2=loser["model"], s2=bool(loser["success"]), l2=int(loser["latency_ms"])))
                         await upsert_stat(conn, winner["model"], fh, reward_w)
                         await upsert_stat(conn, loser["model"], fh, reward_l)
 
                     winner_has_final = bool(str(winner.get("content") or "").strip()) or bool(winner.get("zip_url")) or bool(winner.get("artifact"))
 
                     # artifact for duel completion
-                    self._write_artifact_safely(str(id), {
+                    self._write_artifact_safely(task_id, {
                         "status":"done","mode":"duel",
                         "winner": winner["model"], "loser": loser["model"],
                         "rule_version": str(cfg.get("rule_version","v1")),
@@ -1579,9 +1958,10 @@ class JobQueue:
                         "content": winner.get("content"),
                         "zip_url": winner.get("zip_url"),
                         "zip_notes": winner.get("zip_notes"),
+                        "follow_up_steps": winner.get("follow_up_steps"),
                     })
 
-                    await self.hub.publish(str(id), json.dumps({
+                    await self.hub.publish(task_id, json.dumps({
                         "status":"done",
                         "winner": winner["model"], "loser": loser["model"],
                         "rule_version": str(cfg.get("rule_version","v1")),
@@ -1592,6 +1972,7 @@ class JobQueue:
                         "content": winner.get("content"),
                         "zip_url": winner.get("zip_url"),
                         "zip_notes": winner.get("zip_notes"),
+                        "follow_up_steps": winner.get("follow_up_steps"),
                         "pending_final": not winner_has_final,
                     }))
                     try:
@@ -1599,15 +1980,15 @@ class JobQueue:
                         winner_payload.setdefault("status", "done")
                         winner_payload.setdefault("mode", "duel")
                         winner_payload.setdefault("pending_final", not winner_has_final)
-                        await record_completion(str(id), job, winner_payload)
+                        await record_completion(task_id, job, winner_payload)
                     except Exception:
                         pass
             except asyncio.CancelledError:
                 # task canceled
                 async with eng.begin() as conn:
                     await update_task_status(conn, id, "canceled", model_used=None)
-                await self.hub.publish(str(id), json.dumps({"status":"canceled"}))
-                log.info("task.cancelled", {"id": str(id)})
+                await self.hub.publish(task_id, json.dumps({"status":"canceled"}))
+                log.info("task.cancelled", {"id": task_id})
             except Exception as e:
                 err_summary = (str(e) or "").strip()
                 if not err_summary:
@@ -1617,14 +1998,15 @@ class JobQueue:
                     trace_txt = trace_txt[-6000:]
                 async with eng.begin() as conn:
                     await update_task_status(conn, id, "error", model_used=None, error=err_summary)
-                await self.hub.publish(str(id), json.dumps({
+                await self.hub.publish(task_id, json.dumps({
                     "status":"error",
                     "error": err_summary,
                     "traceback": trace_txt
                 }))
-                log.exception("task.error", {"id": str(id), "error": err_summary})
+                log.exception("task.error", {"id": task_id, "error": err_summary})
             finally:
-                self._inflight.pop(str(id), None)
+                self._inflight.pop(task_id, None)
+                self._start_times.pop(task_id, None)
                 self.queue.task_done()
 
 

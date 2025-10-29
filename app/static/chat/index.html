@@ -33,6 +33,19 @@
     pre {
       margin: 0;
     }
+    @keyframes shimmer {
+      0% { background-position: -150% 0; }
+      100% { background-position: 150% 0; }
+    }
+    .processing .shimmer-text {
+      position: relative;
+      background: linear-gradient(90deg, rgba(148,163,184,0.2) 0%, rgba(226,232,240,0.6) 50%, rgba(148,163,184,0.2) 100%);
+      background-size: 200% 100%;
+      background-clip: text;
+      -webkit-background-clip: text;
+      animation: shimmer 2.4s ease-in-out infinite;
+      color: transparent;
+    }
   </style>
 </head>
 <body class="min-h-screen">
@@ -514,10 +527,18 @@
       header.className = "text-[0.65rem] uppercase tracking-[0.2em] text-slate-400 mb-2";
       header.textContent = role === "user" ? "You" : "Assistant";
 
+      let statusEl = null;
+      if (options.pending) {
+        statusEl = document.createElement("div");
+        statusEl.className = "mb-2 text-xs text-slate-400 italic shimmer-text";
+        statusEl.textContent = options.pendingMessage || "Thinking…";
+      }
+
       const body = document.createElement("div");
       renderMarkdown(body, text);
 
       bubble.appendChild(header);
+      if (statusEl) bubble.appendChild(statusEl);
       bubble.appendChild(body);
       messagesEl.appendChild(bubble);
       scrollMessages();
@@ -525,7 +546,10 @@
       if (options.persist !== false) {
         conversation.push({ role, content: text });
       }
-      return { container: bubble, body };
+      if (options.pending) {
+        bubble.classList.add("processing");
+      }
+      return { container: bubble, body, status: statusEl };
     }
 
     function disableComposer(disabled) {
@@ -565,7 +589,38 @@
         const text = data.result || data.content || data.note || JSON.stringify(data, null, 2);
         renderMarkdown(pendingBubble.body, text);
         conversation.push({ role: "assistant", content: text });
+        if (Array.isArray(data.follow_up_steps) && data.follow_up_steps.length) {
+          const follow = document.createElement("div");
+          follow.className = "mt-4 rounded-2xl border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-200";
+          const title = document.createElement("div");
+          title.className = "font-semibold mb-1 uppercase tracking-wide text-amber-300";
+          title.textContent = "Follow-up";
+          const list = document.createElement("ul");
+          list.className = "list-disc space-y-1 pl-5";
+          data.follow_up_steps.forEach(step => {
+            const item = document.createElement("li");
+            item.textContent = step;
+            list.appendChild(item);
+          });
+          follow.appendChild(title);
+          follow.appendChild(list);
+          pendingBubble.body.appendChild(follow);
+        }
+        pendingBubble.container.classList.remove("processing");
+        if (pendingBubble.status) {
+          pendingBubble.status.classList.remove("shimmer-text");
+        }
+        if (pendingBubble.status) {
+          const elapsed = pendingBubble.started ? Math.max(0, (performance.now() - pendingBubble.started) / 1000) : null;
+          pendingBubble.status.textContent = elapsed ? `Completed in ${elapsed.toFixed(1)}s.` : "Completed.";
+          pendingBubble.status.classList.remove("text-slate-400", "text-slate-200", "italic", "text-amber-300", "text-rose-300");
+          pendingBubble.status.classList.add("text-emerald-300");
+        }
       } catch (err) {
+        pendingBubble.container.classList.remove("processing");
+        if (pendingBubble.status) {
+          pendingBubble.status.classList.remove("shimmer-text");
+        }
         pendingBubble.body.textContent = `Unable to fetch final response: ${err.message || err}`;
       } finally {
         disableComposer(false);
@@ -580,7 +635,7 @@
       const endpoint = `${state.base.replace(/\/$/, "")}/v1/stream/${taskId}`;
       const es = new EventSource(endpoint);
       state.eventSource = es;
-     const handleDone = (payload) => {
+      const handleDone = (payload) => {
         if (state.eventSource) {
           state.eventSource.close();
           state.eventSource = null;
@@ -603,7 +658,34 @@
 
         renderMarkdown(pendingBubble.body, text);
         conversation.push({ role: "assistant", content: text });
-        if (payload.zip_url) {
+        pendingBubble.container.classList.remove("processing");
+        if (pendingBubble.status) {
+          pendingBubble.status.classList.remove("shimmer-text");
+        }
+        if (pendingBubble.status) {
+          const elapsed = pendingBubble.started ? Math.max(0, (performance.now() - pendingBubble.started) / 1000) : null;
+          pendingBubble.status.textContent = elapsed ? `Completed in ${elapsed.toFixed(1)}s.` : "Completed.";
+          pendingBubble.status.classList.remove("text-slate-400", "text-slate-200", "italic");
+          pendingBubble.status.classList.add("text-emerald-300");
+        }
+        if (Array.isArray(payload.follow_up_steps) && payload.follow_up_steps.length) {
+          const follow = document.createElement("div");
+          follow.className = "mt-4 rounded-2xl border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-200";
+          const title = document.createElement("div");
+          title.className = "font-semibold mb-1 uppercase tracking-wide text-amber-300";
+          title.textContent = "Follow-up";
+          const list = document.createElement("ul");
+          list.className = "list-disc space-y-1 pl-5";
+          payload.follow_up_steps.forEach(step => {
+            const item = document.createElement("li");
+            item.textContent = step;
+            list.appendChild(item);
+          });
+          follow.appendChild(title);
+          follow.appendChild(list);
+          pendingBubble.body.appendChild(follow);
+        }
+        if (payload.zip_url && (payload.content || payload.files || payload.follow_up_steps || text.trim())) {
           const link = document.createElement("a");
           link.href = payload.zip_url;
           link.target = "_blank";
@@ -632,10 +714,27 @@
         if (!evt.data) return;
         try {
           const payload = JSON.parse(evt.data);
+          if (payload.message && pendingBubble.status) {
+            let statusText = payload.message;
+            if (typeof payload.elapsed_seconds === "number") {
+              statusText = `${statusText} (${payload.elapsed_seconds.toFixed(1)}s)`;
+            }
+            pendingBubble.status.textContent = statusText;
+            pendingBubble.status.classList.remove("text-emerald-300", "text-rose-300", "text-amber-300", "text-slate-400", "italic");
+            pendingBubble.status.classList.add("text-slate-200");
+            pendingBubble.status.classList.add("shimmer-text");
+          }
           if (payload.status === "done") {
             handleDone(payload);
           } else if (payload.status === "error") {
+            pendingBubble.container.classList.remove("processing");
+            pendingBubble.body.classList.remove("shimmer-text");
             pendingBubble.body.textContent = `Error: ${payload.error || "unknown"}`;
+            if (pendingBubble.status) {
+              pendingBubble.status.textContent = "Something went wrong.";
+              pendingBubble.status.classList.remove("text-emerald-300", "text-slate-200", "shimmer-text");
+              pendingBubble.status.classList.add("text-rose-300");
+            }
             disableComposer(false);
             if (state.eventSource) {
               state.eventSource.close();
@@ -656,6 +755,11 @@
       };
       es.onerror = () => {
         pendingBubble.body.textContent = "Still thinking… collecting the final answer for you.";
+        if (pendingBubble.status) {
+          pendingBubble.status.textContent = "Reconnecting to fetch the final response…";
+          pendingBubble.status.classList.remove("text-emerald-300", "text-slate-200");
+          pendingBubble.status.classList.add("text-amber-300");
+        }
         if (state.eventSource) {
           state.eventSource.close();
           state.eventSource = null;
@@ -676,7 +780,8 @@
       disableComposer(true);
       renderMessage("user", text);
       inputEl.value = "";
-      const pending = renderMessage("assistant", "…", { persist: false });
+      const pending = renderMessage("assistant", "", { persist: false, pending: true });
+      pending.started = performance.now();
 
       try {
         const payload = toTaskPayload(text);

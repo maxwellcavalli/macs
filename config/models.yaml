@@ -1,50 +1,108 @@
 models:
-  # Router / fast generalist
-  - name: mistral
-    tag: mistral:7b-instruct-q4_K_M
-    size: 7b-instruct
-    quant: q4_K_M
-    ctx_size: 8192
-    min_vram_gb: 5
-    speed_rank: 0
-    langs: [java, python, docs, planner]
-
-  # Balanced general-purpose model (reasoning + code)
-  - name: llama3.1
-    tag: llama3.1:8b-instruct-q4_K_M
-    size: 8b-instruct
-    quant: q4_K_M
-    ctx_size: 8192
-    min_vram_gb: 6
-    speed_rank: 1
-    langs: [java, python, docs, planner]
-
-  # Code specialist for deeper refactors/tests
-  - name: qwen2.5-coder
-    tag: qwen2.5-coder:7b-instruct-q4_K_M
-    size: 7b-instruct
-    quant: q4_K_M
-    ctx_size: 8192
-    min_vram_gb: 8
-    speed_rank: 4
-    langs: [java, python]
-
-  # Documentation / explanation specialist
-  - name: gemma2
-    tag: gemma2:9b-instruct-q4_K_M
-    size: 9b-instruct
-    quant: q4_K_M
-    ctx_size: 8192
-    min_vram_gb: 10
-    speed_rank: 5
-    langs: [docs, planner]
-
-  # Planning / long-context helper
-  - name: deepseek-coder
-    tag: deepseek-coder:6.7b-instruct-q4_K_M
-    size: 6.7b-instruct
-    quant: q4_K_M
-    ctx_size: 8192
-    min_vram_gb: 8
-    speed_rank: 5
-    langs: [planner, python]
+- name: mistral
+  tag: mistral:7b-instruct-q4_K_M
+  size: 7b-instruct
+  quant: q4_K_M
+  ctx_size: 8192
+  min_vram_gb: 5
+  speed_rank: 0
+  langs:
+  - language: general
+    usage:
+    - chat
+    - docs
+    - planner
+  - language: java
+    usage:
+    - code
+  - language: python
+    usage:
+    - code
+  num_parallel_sessions: 2
+  gpu_layers: -1
+- name: llama3.1
+  tag: llama3.1:8b-instruct-q4_K_M
+  size: 8b-instruct
+  quant: q4_K_M
+  ctx_size: 8192
+  min_vram_gb: 6
+  speed_rank: 1
+  langs:
+  - language: general
+    usage:
+    - chat
+    - docs
+    - planner
+  - language: java
+    usage:
+    - code
+  - language: python
+    usage:
+    - code
+  num_parallel_sessions: 2
+  gpu_layers: -1
+- name: qwen2.5-coder
+  tag: qwen2.5-coder:7b-instruct-q4_K_M
+  size: 7b-instruct
+  quant: q4_K_M
+  ctx_size: 8192
+  min_vram_gb: 8
+  speed_rank: 4
+  langs:
+  - language: java
+    usage:
+    - code
+  - language: python
+    usage:
+    - code
+  num_parallel_sessions: 2
+  gpu_layers: -1
+- name: gemma2
+  tag: gemma2:9b-instruct-q4_K_M
+  size: 9b-instruct
+  quant: q4_K_M
+  ctx_size: 8192
+  min_vram_gb: 10
+  speed_rank: 5
+  langs:
+  - language: general
+    usage:
+    - docs
+    - planner
+  num_parallel_sessions: 2
+  gpu_layers: -1
+- name: deepseek-coder
+  tag: deepseek-coder:6.7b-instruct-q4_K_M
+  size: 6.7b-instruct
+  quant: q4_K_M
+  ctx_size: 8192
+  min_vram_gb: 8
+  speed_rank: 5
+  langs:
+  - language: java
+    usage:
+    - code
+  - language: python
+    usage:
+    - code
+  num_parallel_sessions: 2
+  gpu_layers: -1
+defaults:
+  chat:
+  - llama3.1:8b-instruct-q4_K_M
+  - mistral:7b-instruct-q4_K_M
+  docs:
+  - llama3.1:8b-instruct-q4_K_M
+  - gemma2:9b-instruct-q4_K_M
+  planner:
+  - llama3.1:8b-instruct-q4_K_M
+  - gemma2:9b-instruct-q4_K_M
+  code:
+  - qwen2.5-coder:7b-instruct-q4_K_M
+  - llama3.1:8b-instruct-q4_K_M
+  code:java:
+  - qwen2.5-coder:7b-instruct-q4_K_M
+  - llama3.1:8b-instruct-q4_K_M
+  code:python:
+  - llama3.1:8b-instruct-q4_K_M
+  - mistral:7b-instruct-q4_K_M

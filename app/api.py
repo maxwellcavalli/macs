@@ -145,6 +145,22 @@ async def submit_task(task: TaskV11, request: Request, x_api_key: str | None = H
             })
         if snippets:
             metadata["memory_context"] = snippets
+            log.info(
+                "task.memory_context.attached",
+                {
+                    "task_id": str(task.id),
+                    "memory_ids": [s.get("id") for s in snippets],
+                },
+            )
+        else:
+            log.info(
+                "task.memory_context.missing",
+                {
+                    "task_id": str(task.id),
+                    "requested_ids": ctx_ids,
+                },
+            )
+            metadata.pop("memory_context_ids", None)
     payload["metadata"] = metadata
     await q.submit(payload)
     return {"task_id": str(task.id)}

@@ -1,5 +1,6 @@
 *.bak*
 docker-compose.override.yml
 artifacts/
+workspace/
 workspace/zips/
 ollama/

@@ -95,6 +95,7 @@ def _fetch_ollama_tags() -> List[Dict[str, Any]]:
                     "name": name,
                     "size": size or "",             # may be empty
                     "quant": quant or "",           # may be empty
+                    "tag": model_str,               # keep the exact tag for downstream callers
                     "ctx_size": DEFAULT_CTX,
                     "min_vram_gb": _heuristic_min_vram_gb(size or "7b"),
                     "speed_rank": 5,                # mid default; config can override
@@ -147,3 +148,22 @@ def available_models(language: str | None = None) -> List[Dict[str, Any]]:
             filtered.append(m)
     filtered.sort(key=lambda x: x.get("speed_rank", 999))
     return filtered
+
+
+def get_mode_defaults(mode: str, language: str | None = None) -> list[str]:
+    reg = _load_file_registry()
+    defaults = reg.get("defaults", {})
+    keys = [mode]
+    if language:
+        lang = str(language).lower()
+        keys.insert(0, f"{mode}:{lang}")
+    out: list[str] = []
+    for key in keys:
+        raw = defaults.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, str):
+            raw = [raw]
+        if isinstance(raw, list):
+            out.extend(str(item) for item in raw)
+    return out

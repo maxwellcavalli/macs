@@ -71,6 +71,8 @@ async def _synthesize_payload(task_id: str, request: Request) -> Optional[dict[s
                         payload.setdefault("result", extra.get("content"))
                     if extra.get("zip_url"):
                         payload["zip_url"] = extra.get("zip_url")
+                    if extra.get("follow_up_steps"):
+                        payload["follow_up_steps"] = extra.get("follow_up_steps")
                 return payload
     except Exception:
         pass
@@ -84,6 +86,8 @@ async def _synthesize_payload(task_id: str, request: Request) -> Optional[dict[s
             payload["zip_url"] = extra["zip_url"]
         if not payload["result"] and extra.get("content"):
             payload["result"] = extra["content"]
+        if extra.get("follow_up_steps"):
+            payload["follow_up_steps"] = extra.get("follow_up_steps")
         return payload
     return None
 

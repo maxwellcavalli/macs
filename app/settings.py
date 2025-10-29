@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     workspace_memory_enabled: bool = Field(False, alias="WORKSPACE_MEMORY_ENABLED")
     workspace_memory_embeddings: bool = Field(False, alias="WORKSPACE_MEMORY_EMBEDDINGS")
 
+    chat_mode_default: str = Field("llama3.1:8b-instruct-q4_K_M", alias="CHAT_MODE_DEFAULT")
+
     class Config:
         env_file = ".env"
         extra = "ignore"
