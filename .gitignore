@@ -11,3 +11,4 @@ bandit-*.csv
 bandit-*.jsonl
 /build/
 /dist/
+/workspace/.duel/
