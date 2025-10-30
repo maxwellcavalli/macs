@@ -1,7 +1,8 @@
 from __future__ import annotations
 from .bandit_client import record as bandit_record
-import asyncio, time, json, textwrap, os, re, traceback, posixpath
+import asyncio, time, json, textwrap, os, re, traceback, posixpath, copy
 from typing import Dict, Any, List, Tuple, Optional
+from dataclasses import dataclass, field
 from pathlib import Path
 from fnmatch import fnmatch
 from .sse import StreamHub
@@ -40,11 +41,18 @@ CODE_KEYWORDS = {
     "implement","fix","bug","refactor","function","class","module","api","endpoint",
     "write code","generate code","compile","build","test","unit test","integration test",
     "sql","schema","service","controller","handler","repository",
-    "project","projects","skeleton","scaffold","structure","template","setup","zip","archive"
+    "project","projects","skeleton","scaffold","structure","template","setup","zip","archive",
+    "download","markdown","file","files"
 }
 DOC_KEYWORDS = {"document","docs","documentation","explain","tutorial","guide","readme","summary","describe","notes"}
 PLANNER_KEYWORDS = {"plan","outline","steps","strategy","roadmap","analysis","approach","design"}
 CHAT_KEYWORDS = {"hello","hi","hey","greetings","thanks","how are","say","tell me","question","what is","who is","help me understand","conversation","chat"}
+
+def _is_codey_prompt(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in CODE_KEYWORDS)
 
 MODE_PREFERENCES = {
     "chat": [
@@ -123,6 +131,22 @@ ZIP_SKIP_SUFFIXES = tuple(
         ".class,.jar,.war,.ear,.zip,.tar,.gz,.tgz,.xz,.png,.jpg,.jpeg,.gif,.bmp,.ico,.exe,.dll,.so,.dylib,.bin,.lock,.log"
     ).split(",")) if suf.strip()
 )
+
+TOT_BEAM_WIDTH_DEFAULT = int(os.getenv("TOT_BEAM_WIDTH", "2") or "2")
+TOT_MAX_DEPTH_DEFAULT = int(os.getenv("TOT_MAX_DEPTH", "3") or "3")
+TOT_COMPILE_WEIGHT = float(os.getenv("TOT_COMPILE_WEIGHT", "1.0") or "1.0")
+TOT_TEST_WEIGHT = float(os.getenv("TOT_TEST_WEIGHT", "1.5") or "1.5")
+TOT_LINT_WEIGHT = float(os.getenv("TOT_LINT_WEIGHT", "0.4") or "0.4")
+TOT_SMOKE_WEIGHT = float(os.getenv("TOT_SMOKE_WEIGHT", "0.4") or "0.4")
+TOT_LATENCY_PENALTY = float(os.getenv("TOT_LATENCY_PENALTY", "0.0005") or "0.0005")
+
+
+@dataclass
+class _ToTNode:
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    score: float = float("-inf")
+    result: Optional[Dict[str, Any]] = None
+
 
 CODE_BLOCK_RE = re.compile(r"```([\w.+-]*)\n([\s\S]*?)```", re.MULTILINE)
 FILE_LINE_RE = re.compile(r"^\s*(?:[-*•+\d.)>\s]*)?(?:file|path)\s*[:=]\s*([^\s`]+)", re.IGNORECASE | re.MULTILINE)
@@ -215,7 +239,55 @@ def _format_model_name(m: Dict[str, Any]) -> str:
     quant = m.get("quant", "")
     return f"{m.get('name')}:{size_tag}-{quant}".strip("-")
 
+def _usage_matches_mode(mode: str, usage: Any) -> bool:
+    if usage is None:
+        return True
+    if isinstance(usage, str):
+        usage_set = {usage.lower()}
+    else:
+        try:
+            usage_set = {str(item).lower() for item in usage}
+        except Exception:
+            usage_set = {str(usage).lower()}
+    if not usage_set:
+        return True
+    if mode == "code":
+        return "code" in usage_set
+    if mode == "chat":
+        return "chat" in usage_set
+    if mode == "docs":
+        return "docs" in usage_set
+    if mode == "planner":
+        return "planner" in usage_set
+    return True
+
+def _filter_models_for_mode(mode: str, models: List[Dict[str, Any]], language: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not models:
+        return models
+    language_lc = (language or "").lower()
+    compatible: List[Dict[str, Any]] = []
+    for model in models:
+        langs_meta = model.get("langs") or []
+        if not langs_meta:
+            compatible.append(model)
+            continue
+        for entry in langs_meta:
+            try:
+                entry_lang = str(entry.get("language") or "").lower()
+            except Exception:
+                entry_lang = ""
+            if language_lc and entry_lang not in {language_lc, "general", "any", ""}:
+                continue
+            usage = entry.get("usage") if isinstance(entry, dict) else None
+            if _usage_matches_mode(mode, usage):
+                compatible.append(model)
+                break
+    if compatible:
+        return compatible
+    return models
+
 def _order_models_for_mode(mode: str, models: List[Dict[str, Any]], language: Optional[str] = None) -> List[Dict[str, Any]]:
+    models = _filter_models_for_mode(mode, models, language)
     preferred = get_mode_defaults(mode, language)
     if mode == "chat":
         chat_default = settings.chat_mode_default
@@ -497,11 +569,17 @@ def _infer_mode(job: Dict[str, Any]) -> str:
     include = repo.get("include") or []
     code_structure = bool(expected or include)
 
-    code_clues = (
-        job_type in {"CODE", "TEST", "REFACTOR"}
-        or code_structure
-        or any(kw in goal_l for kw in CODE_KEYWORDS)
-    )
+    has_code_keywords = any(kw in goal_l for kw in CODE_KEYWORDS)
+    job_type_is_code = job_type in {"CODE", "TEST", "REFACTOR"}
+    code_clues = job_type_is_code or code_structure or has_code_keywords
+    if (
+        job_type_is_code
+        and not code_structure
+        and not has_code_keywords
+        and goal
+        and len(goal.split()) <= 8
+    ):
+        code_clues = False
     doc_clues = job_type == "DOC" or any(kw in goal_l for kw in DOC_KEYWORDS)
     planner_clues = job_type == "PLAN" or any(kw in goal_l for kw in PLANNER_KEYWORDS)
     chat_clues = (
@@ -986,18 +1064,28 @@ def _build_prompt(job: dict) -> str:
             )
         repo_section_prompt = ""
         repo_spec = inp.get("repo") or {}
-        repo_snippets = _collect_repo_prompt_snippets(repo_spec)
+        repo_path_raw = str(repo_spec.get("path") or "").strip()
+        repo_snippets: List[Tuple[str, str]] = []
+        if repo_path_raw:
+            normalized_repo = _normalize_repo_rel(repo_path_raw)
+            if normalized_repo and normalized_repo != ".":
+                repo_snippets = _collect_repo_prompt_snippets({**repo_spec, "path": normalized_repo})
         if repo_snippets:
             lines: List[str] = ["Uploaded repository snippets:"]
             for rel, snippet in repo_snippets:
                 lines.append(f"- {rel}:\n{snippet}")
             repo_section_prompt = "\n".join(lines) + "\n\n"
+        codey = _is_codey_prompt(goal)
+        instructions: List[str] = []
+        instructions.append("You are a friendly engineering assistant. Answer in natural language unless the user clearly asks for code.")
+        if codey:
+            instructions.append(
+                "When the user requests code, files, scaffolds, or archives, emit the actual file contents. For every file, add a line 'File: relative/path.ext' followed by a fenced code block."
+            )
+        else:
+            instructions.append("Unless the user requests code, respond conversationally without creating file listings.")
         return textwrap.dedent(f"""
-        You are a friendly engineering assistant. Answer in natural language, keep responses concise, and avoid writing source code unless the user clearly asks for it.
-        When the user requests code, files, scaffolds, or archives, emit the actual file contents. For every file:
-          - Add a line 'File: relative/path.ext' (relative to project root).
-          - Follow with a fenced code block containing the file body.
-          - Do NOT reference external download links or say 'see attached zip'; provide the real content inline instead.
+        {' '.join(instructions)}
         {memory_section}{repo_section_prompt}{history_section}Latest user message: {goal}
         """).strip()
 
@@ -1195,6 +1283,12 @@ class JobQueue:
         from .governance import enforce_fs_write
         safe_model = model_str.replace("/", "_").replace(":", "_").replace("-", "_")
         rel_dir = f".duel/{task_id}/{safe_model}"
+        tot_suffix = ((job.get("metadata") or {}).get("_tot_suffix"))
+        if tot_suffix:
+            rel_dir = f"{rel_dir}/{tot_suffix}"
+        tier_suffix = ((job.get("metadata") or {}).get("_tier_suffix"))
+        if tier_suffix:
+            rel_dir = f"{rel_dir}/{tier_suffix}"
         dir_path, ok = resolve_safe_path(rel_dir)
         if not enforce_fs_write(ok, rel_dir):
             raise RuntimeError("Write outside workspace denied")
@@ -1216,11 +1310,33 @@ class JobQueue:
         # prompt + stream
         prompt = _build_prompt(job)
         ctx = int(candidate.get("ctx_size", 8192) or 8192)
+        if mode in {"chat", "docs", "planner"}:
+            ctx = min(ctx, 4096)
+            num_predict = 1024
+        else:
+            ctx = min(ctx, 6144)
+            num_predict = 2048
         buf_parts: List[str] = []
         first_token_at: Optional[float] = None
         chunk_count = 0
+        prompt_tokens: Optional[int] = None
+        completion_tokens: Optional[int] = None
+        last_meta: Optional[Dict[str, Any]] = None
+        codey_request = mode == "chat" and _is_codey_prompt(goal_text)
+
         try:
-            async for chunk in generate_stream(model_str, prompt, num_ctx=ctx, temperature=0.2):
+            async for chunk, final_meta in generate_stream(
+                model_str,
+                prompt,
+                num_ctx=ctx,
+                num_predict=num_predict,
+                temperature=0.2,
+            ):
+                if final_meta:
+                    last_meta = final_meta
+                if final_meta and prompt_tokens is None:
+                    prompt_tokens = int(final_meta.get("prompt_eval_count" or "prompt_tokens") or 0)
+                    completion_tokens = int(final_meta.get("eval_count" or "completion_tokens") or 0)
                 if "response" in chunk and not chunk.get("done"):
                     text_piece = chunk.get("response") or ""
                     if text_piece:
@@ -1238,6 +1354,18 @@ class JobQueue:
                 llm_generation_latency.labels(model=model_str).observe(total_duration)
             except Exception:
                 pass
+            if prompt_tokens is None and last_meta:
+                prompt_tokens = int(
+                    last_meta.get("prompt_eval_count")
+                    or last_meta.get("prompt_tokens")
+                    or 0
+                )
+            if completion_tokens is None and last_meta:
+                completion_tokens = int(
+                    last_meta.get("eval_count")
+                    or last_meta.get("completion_tokens")
+                    or 0
+                )
             if first_token_at is not None:
                 log.info(
                     "candidate.stream.complete",
@@ -1255,11 +1383,19 @@ class JobQueue:
                     {"task_id": task_id, "model": model_str, "total_ms": int(total_duration * 1000)},
                 )
         except OllamaError as e:
-            generated = f"// ollama error: {e}\n"
+            log.error(
+                "candidate.ollama_error",
+                {"task_id": task_id, "model": model_str, "error": str(e)},
+            )
+            raise
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            generated = f"// runtime error: {e}\n"
+            log.exception(
+                "candidate.runtime_error",
+                {"task_id": task_id, "model": model_str, "error": str(e)},
+            )
+            raise
 
         # sanitize + write
         raw_output = generated
@@ -1278,14 +1414,7 @@ class JobQueue:
                     body = _sanitize_java(body, rel)
                 sanitized_generated[rel] = body
 
-            try:
-                repo_files, repo_notes, repo_prefix_hint, repo_root_path = _collect_repo_snapshot(job)
-            except Exception:
-                repo_files, repo_notes, repo_prefix_hint, repo_root_path = {}, [], None, None
-                log.exception(
-                    "zip.repo.snapshot.unhandled_error",
-                    {"task_id": task_id, "model": model_str},
-                )
+            repo_files, repo_notes, repo_prefix_hint, repo_root_path = {}, [], None, None
             zip_notes.extend(repo_notes)
             repo_files = {k: v for k, v in repo_files.items() if isinstance(v, str)}
             result_map: Dict[str, str] = {}
@@ -1361,13 +1490,18 @@ class JobQueue:
                 response_body = content if content.endswith("\n") else content + "\n"
                 result_map.setdefault("response.md", response_body)
                 zip_notes.append("Included response.md with model reply.")
-            if result_map:
+            # chat/docs/planner responses are streamed inline; skip zip packaging to avoid redundant downloads
+            zip_path = None
+            zip_url = None
+            if result_map and codey_request:
                 try:
                     zip_file = write_zip(str(task_id), result_map, default_name="response.md")
                     zip_path = str(zip_file)
                     zip_url = f"/zips/{zip_file.name}"
                 except Exception as exc:
                     zip_notes.append(f"Zip assembly failed: {exc}")
+            else:
+                zip_notes.append("Inline response only; zip not generated.")
             return {
                 "model": model_str,
                 "success": bool(content or result_map),
@@ -1387,6 +1521,13 @@ class JobQueue:
                 "pending_final": False,
                 "missing_components": [],
                 "follow_up_steps": [],
+                "sandbox_root": str(dir_path),
+                "merge_root": None,
+                "lint_pass": False,
+                "smoke_pass": False,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "ctx_limit": ctx,
             }
 
         if mode == "code" and rel_primary.endswith(".java"):
@@ -1605,6 +1746,13 @@ class JobQueue:
             "pending_final": bool(missing_components) or not (has_primary or has_zip or has_artifact),
             "missing_components": missing_components,
             "follow_up_steps": follow_up_steps,
+            "sandbox_root": str(dir_path),
+            "merge_root": str(merge_root),
+            "lint_pass": False,
+            "smoke_pass": False,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "ctx_limit": ctx,
         }
         # --- Bandit autolog (inserted) ---
         try:
@@ -1640,7 +1788,17 @@ class JobQueue:
                 "logs": {"build_stdout_tail": "", "build_stderr_tail": f"candidate timed out after {CANDIDATE_TIMEOUT_SEC}s"},
                 "artifact": "",
                 "content": "",
+                "zip_path": None,
+                "zip_url": None,
+                "files": {},
+                "zip_notes": [],
                 "pending_final": False,
+                "missing_components": [],
+                "follow_up_steps": [],
+                "sandbox_root": None,
+                "merge_root": None,
+                "lint_pass": False,
+                "smoke_pass": False,
             }
             # --- Bandit autolog (inserted) ---
             try:
@@ -1661,6 +1819,422 @@ class JobQueue:
         except asyncio.CancelledError:
             log.info("candidate.canceled", {"task_id": task_id, "model": _format_model_name(candidate)})
             raise
+
+    def _tot_history_summary(self, history: List[Dict[str, Any]]) -> str:
+        if not history:
+            return "[]"
+        trimmed = history[-4:]
+        safe_items: List[Dict[str, Any]] = []
+        for idx, item in enumerate(trimmed, start=max(1, len(history) - len(trimmed) + 1)):
+            safe_items.append({
+                "iteration": idx,
+                "title": (item.get("title") or "plan"),
+                "score": item.get("score"),
+                "compile_pass": bool(item.get("compile_pass")),
+                "test_pass": bool(item.get("test_pass")),
+                "lint_pass": bool(item.get("lint_pass")),
+                "smoke_pass": bool(item.get("smoke_pass")),
+            })
+        try:
+            return json.dumps(safe_items, ensure_ascii=False)
+        except Exception:
+            return "[]"
+
+    def _format_plan_for_goal(self, plan: Dict[str, Any]) -> str:
+        title = str(plan.get("title") or "").strip()
+        summary = str(plan.get("summary") or "").strip()
+        steps = [str(step).strip() for step in plan.get("steps") or [] if str(step).strip()]
+        lines: List[str] = []
+        if title:
+            lines.append(title)
+        if summary:
+            lines.append(summary)
+        if steps:
+            lines.append("Steps:")
+            for step in steps:
+                lines.append(f"- {step}")
+        return "\n".join(lines).strip()
+
+    async def _call_model_text(self, model: Dict[str, Any], prompt: str, *, temperature: float = 0.2) -> str:
+        model_str = _format_model_name(model)
+        ctx = int(model.get("ctx_size", 4096) or 4096)
+        buf: List[str] = []
+        try:
+            async for chunk in generate_stream(model_str, prompt, num_ctx=ctx, temperature=temperature):
+                if chunk.get("done"):
+                    break
+                piece = chunk.get("response") or ""
+                if piece:
+                    buf.append(piece)
+        except OllamaError as exc:
+            log.warning("tot.model.error", {"model": model_str, "error": str(exc)})
+            return ""
+        except Exception as exc:
+            log.warning("tot.model.unexpected", {"model": model_str, "error": str(exc)})
+            return ""
+        return "".join(buf).strip()
+
+    def _build_tot_plan_prompt(self, job: Dict[str, Any], history: List[Dict[str, Any]], beam_width: int) -> str:
+        inp = job.get("input") or {}
+        language = str(inp.get("language") or "general")
+        goal_text = str(inp.get("goal") or "").strip()
+        repo_hints = _collect_repo_include_hints(job)
+        repo_summary = ", ".join(repo_hints[:5]) if repo_hints else "n/a"
+        history_json = self._tot_history_summary(history)
+        return textwrap.dedent(
+            f"""
+            You are an autonomous agent planning incremental code edits for another coding agent.
+            Primary goal: {goal_text}
+            Language: {language}
+            Repository hints: {repo_summary}
+            Prior attempts (JSON summary): {history_json}
+
+            Propose up to {beam_width} new candidate edit plans.
+            Respond with a JSON array only (no prose). Each object must contain:
+              - "title": short name
+              - "summary": one-sentence strategy
+              - "steps": array of 2-4 concrete edit actions (strings)
+            Do not include any explanations outside the JSON array.
+            """
+        ).strip()
+
+    async def _generate_tot_plans(self, job: Dict[str, Any], model: Dict[str, Any], history: List[Dict[str, Any]], beam_width: int) -> List[Dict[str, Any]]:
+        prompt = self._build_tot_plan_prompt(job, history, beam_width)
+        raw = await self._call_model_text(model, prompt, temperature=0.15)
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("tot.plan.decode_failed", {"raw": raw[:200]})
+            return []
+        if not isinstance(parsed, list):
+            return []
+        plans: List[Dict[str, Any]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            summary = str(item.get("summary") or "").strip()
+            steps_list = item.get("steps") or []
+            steps = [str(step).strip() for step in steps_list if str(step).strip()]
+            if not title and not summary and not steps:
+                continue
+            plans.append({"title": title, "summary": summary, "steps": steps})
+            if len(plans) >= beam_width:
+                break
+        return plans
+
+    async def _run_tot_quality_checks(self, res: Dict[str, Any]) -> Tuple[bool, bool]:
+        merge_root = res.get("merge_root")
+        if not merge_root:
+            return False, False
+        path = Path(str(merge_root))
+        if not path.exists():
+            return False, False
+
+        def _has_file_with_suffix(suffix: str) -> bool:
+            try:
+                generator = path.rglob(suffix)
+                for _ in generator:
+                    return True
+            except Exception:
+                return False
+            return False
+
+        lint_pass = False
+        smoke_pass = False
+        try:
+            if _has_file_with_suffix("*.py"):
+                lint_res = await run_sandboxed(["ruff", "."], cwd=str(path), timeout=90)
+                lint_pass = lint_res.returncode == 0
+        except Exception as exc:
+            log.debug("tot.lint.error", {"path": str(path), "error": str(exc)})
+        try:
+            if settings.ff_smoke_tests and (path / "tests").exists():
+                smoke_res = await run_sandboxed(["pytest", "-q"], cwd=str(path), timeout=120)
+                smoke_pass = smoke_res.returncode == 0
+        except Exception as exc:
+            log.debug("tot.smoke.error", {"path": str(path), "error": str(exc)})
+        return lint_pass, smoke_pass
+
+    def _tot_score(self, res: Dict[str, Any], lint_pass: bool, smoke_pass: bool) -> float:
+        score = 0.0
+        if res.get("compile_pass"):
+            score += TOT_COMPILE_WEIGHT
+        if res.get("test_pass"):
+            score += TOT_TEST_WEIGHT
+        if lint_pass:
+            score += TOT_LINT_WEIGHT
+        if smoke_pass:
+            score += TOT_SMOKE_WEIGHT
+        latency = float(res.get("latency_ms") or 0.0)
+        score -= latency * TOT_LATENCY_PENALTY
+        return score
+
+    async def _run_tot_beam(self, job: Dict[str, Any], candidate: Dict[str, Any], task_id: str) -> Optional[Dict[str, Any]]:
+        meta = job.get("metadata") or {}
+        try:
+            beam_width = int(meta.get("tot_beam_width", TOT_BEAM_WIDTH_DEFAULT))
+        except Exception:
+            beam_width = TOT_BEAM_WIDTH_DEFAULT
+        try:
+            max_depth = int(meta.get("tot_max_depth", TOT_MAX_DEPTH_DEFAULT))
+        except Exception:
+            max_depth = TOT_MAX_DEPTH_DEFAULT
+        beam_width = max(1, min(beam_width, 5))
+        max_depth = max(1, min(max_depth, 5))
+
+        base_goal = str(((job.get("input") or {}).get("goal")) or "")
+        frontier: List[_ToTNode] = [_ToTNode(history=[], score=float("-inf"), result=None)]
+        best_node: Optional[_ToTNode] = None
+        attempt_counter = 0
+
+        for depth in range(max_depth):
+            await self._publish_status(task_id, f"Exploring edit plans (depth {depth + 1}/{max_depth})…", stage="tot-planning")
+            next_frontier: List[_ToTNode] = []
+            for node in frontier:
+                plans = await self._generate_tot_plans(job, candidate, node.history, beam_width)
+                if not plans:
+                    continue
+                await self._publish_status(task_id, f"Evaluating {len(plans)} plan option(s) at depth {depth + 1}…", stage="tot-execute")
+                for plan_idx, plan in enumerate(plans):
+                    attempt_counter += 1
+                    plan_text = self._format_plan_for_goal(plan)
+                    variant = copy.deepcopy(job)
+                    variant_input = variant.get("input") or {}
+                    variant_input = dict(variant_input)
+                    augmented_goal = base_goal
+                    if plan_text:
+                        augmented_goal = (
+                            f"{base_goal}\n\nFollow this implementation plan precisely:\n{plan_text}\n\n"
+                            "Only output the files that changed and avoid restating this plan."
+                        )
+                    variant_input["goal"] = augmented_goal
+                    variant["input"] = variant_input
+                    variant_meta = dict(variant.get("metadata") or {})
+                    variant_meta["_tot_suffix"] = f"tot_{depth}_{plan_idx}_{attempt_counter}"
+                    variant["metadata"] = variant_meta
+                    try:
+                        res = await self._run_candidate(variant, candidate, task_id)
+                    except Exception as exc:
+                        log.exception("tot.candidate.execution_failed", {"task_id": task_id, "error": str(exc)})
+                        continue
+                    lint_pass, smoke_pass = await self._run_tot_quality_checks(res)
+                    res["lint_pass"] = lint_pass
+                    res["smoke_pass"] = smoke_pass
+                    score = self._tot_score(res, lint_pass, smoke_pass)
+                    res["tot_score"] = score
+                    entry = {
+                        "title": plan.get("title") or f"Plan {plan_idx + 1}",
+                        "plan": plan_text[:1000],
+                        "score": score,
+                        "compile_pass": bool(res.get("compile_pass")),
+                        "test_pass": bool(res.get("test_pass")),
+                        "lint_pass": lint_pass,
+                        "smoke_pass": smoke_pass,
+                        "latency_ms": res.get("latency_ms"),
+                    }
+                    child_history = list(node.history) + [entry]
+                    child_node = _ToTNode(history=child_history, score=score, result=res)
+                    next_frontier.append(child_node)
+                    if best_node is None or score > best_node.score:
+                        best_node = _ToTNode(history=child_history, score=score, result=res)
+                        log.info(
+                            "tot.best.update",
+                            {
+                                "task_id": task_id,
+                                "score": round(score, 3),
+                                "compile_pass": res.get("compile_pass"),
+                                "test_pass": res.get("test_pass"),
+                                "lint_pass": lint_pass,
+                                "smoke_pass": smoke_pass,
+                            },
+                        )
+            if not next_frontier:
+                break
+            next_frontier.sort(key=lambda n: n.score, reverse=True)
+            frontier = next_frontier[:beam_width]
+
+        if best_node is None or best_node.result is None:
+            log.warning("tot.no_winner", {"task_id": task_id})
+            return None
+        return best_node.result
+
+    def _resolve_tiered_models(self, job: Dict[str, Any], ordered: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        meta = job.get("metadata") or {}
+        hints = job.get("routing_hints") or {}
+        spec = meta.get("tiered_models") or hints.get("tiered_models")
+        tiers: List[List[Dict[str, Any]]] = []
+        used: set[str] = set()
+        if spec and isinstance(spec, list):
+            for tier_spec in spec:
+                identifiers = tier_spec if isinstance(tier_spec, (list, tuple)) else [tier_spec]
+                bucket: List[Dict[str, Any]] = []
+                for ident in identifiers:
+                    ident_str = str(ident or "").strip().lower()
+                    if not ident_str:
+                        continue
+                    for model in ordered:
+                        tag = str(model.get("tag") or model.get("model") or "").lower()
+                        name = str(model.get("name") or "").lower()
+                        short = tag.split(":", 1)[0]
+                        if ident_str in {tag, name, short}:
+                            canon = tag or name
+                            if canon and canon in used:
+                                break
+                            bucket.append(model)
+                            if canon:
+                                used.add(canon)
+                            break
+                if bucket:
+                    tiers.append(bucket)
+        if tiers:
+            return tiers
+        simple: List[List[Dict[str, Any]]] = []
+        for model in ordered:
+            tag = model.get("tag") or model.get("model") or model.get("name")
+            if not tag:
+                continue
+            tag_l = str(tag).lower()
+            if tag_l in used:
+                continue
+            simple.append([model])
+            used.add(tag_l)
+            if len(simple) >= 3:
+                break
+        return simple
+
+    def _summarize_tier_result(self, res: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        status_bits: List[str] = []
+        status_bits.append("compile" + ("✅" if res.get("compile_pass") else "❌"))
+        status_bits.append("tests" + ("✅" if res.get("test_pass") else "❌"))
+        if res.get("lint_pass"):
+            status_bits.append("lint✅")
+        if res.get("smoke_pass"):
+            status_bits.append("smoke✅")
+        lines.append("Status: " + ", ".join(status_bits))
+        artifact = str(res.get("artifact") or "").strip()
+        if artifact:
+            lines.append(f"Primary artifact: {artifact}")
+        follow = res.get("follow_up_steps") or []
+        if follow:
+            preview = "; ".join(str(step) for step in follow[:3])
+            lines.append(f"Follow-up suggestions: {preview}")
+        content = str(res.get("content") or "").strip()
+        if content:
+            snippet = textwrap.shorten(content.replace("\n", " "), width=220, placeholder="…")
+            lines.append(f"Content preview: {snippet}")
+        return "\n".join(lines)
+
+    def _augment_goal_for_tier(self, base_goal: str, tier_index: int, prior_label: str, summary: str) -> str:
+        base_goal = str(base_goal or "").strip()
+        augment_lines = [
+            base_goal,
+            "",
+            f"Refine and improve the existing implementation produced in tier {tier_index} ({prior_label}).",
+        ]
+        if summary.strip():
+            augment_lines.append("Summary of prior result:")
+            augment_lines.append(summary.strip())
+        augment_lines.append("Preserve working code, address gaps, and elevate quality and tests.")
+        return "\n".join(augment_lines).strip()
+
+    async def _run_tiered_refine(self, job: Dict[str, Any], ordered: List[Dict[str, Any]], task_id: str) -> Optional[Dict[str, Any]]:
+        tiers = self._resolve_tiered_models(job, ordered)
+        if not tiers:
+            return None
+        base_goal = str(((job.get("input") or {}).get("goal")) or "")
+        meta = job.get("metadata") or {}
+        hints = job.get("routing_hints") or {}
+        stop_on_success = meta.get("tiered_stop_on_success")
+        if stop_on_success is None:
+            stop_on_success = hints.get("tiered_stop_on_success")
+        if stop_on_success is None:
+            stop_on_success = True
+        history_entries: List[Dict[str, Any]] = []
+        best_res: Optional[Dict[str, Any]] = None
+        best_score = float("-inf")
+
+        for idx, tier_models in enumerate(tiers):
+            if not tier_models:
+                continue
+            candidate = tier_models[0]
+            label = _format_model_name(candidate)
+            await self._publish_status(
+                task_id,
+                f"Tier {idx + 1}: generating with {label}…",
+                stage="tiered-generating",
+            )
+            variant = copy.deepcopy(job)
+            variant_input = dict(variant.get("input") or {})
+            if idx > 0 and best_res is not None:
+                summary = self._summarize_tier_result(best_res)
+                prior_label = str(best_res.get("model") or label)
+                variant_input["goal"] = self._augment_goal_for_tier(base_goal, idx + 1, prior_label, summary)
+            else:
+                variant_input["goal"] = base_goal
+            variant["input"] = variant_input
+            variant_meta = dict(variant.get("metadata") or {})
+            variant_meta["_tier_suffix"] = f"tier{idx + 1}"
+            variant_meta["tier_index"] = idx
+            variant_meta["tier_label"] = label
+            variant["metadata"] = variant_meta
+            tier_task = asyncio.create_task(self._run_candidate(variant, candidate, task_id))
+            self._inflight[task_id].append(tier_task)
+            res = await tier_task
+            res["tier_index"] = idx
+            res["tier_label"] = label
+            reward = 1.0 if res.get("test_pass") else (0.5 if res.get("compile_pass") else 0.0)
+            try:
+                bandit_record_event(
+                    res.get("model") or label,
+                    float(reward),
+                    {"src": "tiered", "task_id": task_id, "tier_index": idx},
+                )
+            except Exception:
+                pass
+            score = self._tot_score(res, bool(res.get("lint_pass")), bool(res.get("smoke_pass")))
+            res["tier_score"] = score
+            history_entry = {
+                "index": idx,
+                "model": res.get("model"),
+                "compile_pass": bool(res.get("compile_pass")),
+                "test_pass": bool(res.get("test_pass")),
+                "lint_pass": bool(res.get("lint_pass")),
+                "smoke_pass": bool(res.get("smoke_pass")),
+                "latency_ms": res.get("latency_ms"),
+                "score": score,
+            }
+            history_entries.append(history_entry)
+            await self.hub.publish(
+                task_id,
+                json.dumps(
+                    {
+                        "status": "running",
+                        "stage": "tiered-result",
+                        "tier_index": idx,
+                        "tier_label": label,
+                        "model": res.get("model"),
+                        "compile_pass": res.get("compile_pass"),
+                        "test_pass": res.get("test_pass"),
+                        "lint_pass": res.get("lint_pass"),
+                        "smoke_pass": res.get("smoke_pass"),
+                        "score": round(score, 3),
+                    }
+                ),
+            )
+            if best_res is None or score > best_score:
+                best_res = res
+                best_score = score
+            if stop_on_success and res.get("test_pass"):
+                break
+
+        if best_res is not None:
+            best_res.setdefault("tier_history", history_entries)
+            best_res.setdefault("tier_best_score", best_score)
+        return best_res
 
     def _score(self, r: Dict[str, Any], cfg: Dict[str, Any]) -> float:
         base = (cfg["success_weight"] * (1.0 if r["success"] else 0.0))
@@ -1747,18 +2321,45 @@ class JobQueue:
                     base = _order_models_for_mode(mode, base_models, language)
                     async with eng.connect() as conn:
                         ordered = await rank_models(conn, base, fh)
-                    m = ordered[0] if ordered else None
-                    if not m:
+                    if not ordered:
                         raise RuntimeError("no available models")
-                    await self._publish_status(task_id, f"Generating answer with {_format_model_name(m)}…", stage="generating")
-                    t = asyncio.create_task(self._run_candidate(job, m, task_id))
-                    self._inflight[task_id].append(t)
-                    res = await t
+                    strategy = str((meta_for_log.get("strategy") or (job.get("routing_hints") or {}).get("strategy") or "")).strip().lower()
+                    res: Optional[Dict[str, Any]] = None
+                    result_mode = "single"
+                    if strategy == "tiered_refine" and mode == "code":
+                        res = await self._run_tiered_refine(job, ordered, task_id)
+                        if res is not None:
+                            result_mode = "tiered"
+                        else:
+                            log.info("tiered_refine.fallback", {"task_id": task_id})
+                    if res is None:
+                        m = ordered[0]
+                        if not m:
+                            raise RuntimeError("no available models")
+                        if strategy == "tot_beam" and mode == "code":
+                            result_mode = "tot"
+                            await self._publish_status(task_id, f"Searching tree of edits with {_format_model_name(m)}…", stage="tot-search")
+                            tot_task = asyncio.create_task(self._run_tot_beam(job, m, task_id))
+                            self._inflight[task_id].append(tot_task)
+                            res = await tot_task
+                            if res is None:
+                                result_mode = "single"
+                                await self._publish_status(task_id, f"Tree search fallback: generating answer with {_format_model_name(m)}…", stage="generating")
+                                fallback_task = asyncio.create_task(self._run_candidate(job, m, task_id))
+                                self._inflight[task_id].append(fallback_task)
+                                res = await fallback_task
+                        else:
+                            await self._publish_status(task_id, f"Generating answer with {_format_model_name(m)}…", stage="generating")
+                            t = asyncio.create_task(self._run_candidate(job, m, task_id))
+                            self._inflight[task_id].append(t)
+                            res = await t
+                    if res is None:
+                        raise RuntimeError("strategy execution returned no result")
                     reward = 1.0 if res.get("test_pass") else (0.5 if res.get("compile_pass") else 0.0)
 
                     # bandit: log real single-run reward
                     try:
-                        bandit_record_event(res.get("model") or "unknown", float(reward), {"src":"queue","task_id": task_id,"mode":"single"})
+                        bandit_record_event(res.get("model") or "unknown", float(reward), {"src":"queue","task_id": task_id,"mode": result_mode})
                     except Exception:
                         pass
 
@@ -1768,25 +2369,35 @@ class JobQueue:
 
                     # artifact for SSE completion
                     self._write_artifact_safely(task_id, {
-                        "status":"done","mode":"single",
+                        "status":"done","mode": result_mode,
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
+                        "lint_pass":res.get("lint_pass"), "smoke_pass":res.get("smoke_pass"),
                         "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
                         "content": res.get("content"),
                         "zip_url": res.get("zip_url"),
                         "zip_notes": res.get("zip_notes"),
                         "follow_up_steps": res.get("follow_up_steps"),
+                        "tier_history": res.get("tier_history"),
+                        "tier_best_score": res.get("tier_best_score"),
                     })
 
                     await self.hub.publish(task_id, json.dumps({
                         "status":"done",
+                        "mode": result_mode,
                         "model":res.get("model"), "latency_ms":res.get("latency_ms"),
                         "compile_pass":res.get("compile_pass"), "test_pass":res.get("test_pass"),
+                        "lint_pass":res.get("lint_pass"), "smoke_pass":res.get("smoke_pass"),
                         "tool":res.get("tool"), "artifact":res.get("artifact"), "logs":res.get("logs"),
                         "content": res.get("content"),
                         "zip_url": res.get("zip_url"),
                         "zip_notes": res.get("zip_notes"),
                         "follow_up_steps": res.get("follow_up_steps"),
+                        "prompt_tokens": res.get("prompt_tokens"),
+                        "completion_tokens": res.get("completion_tokens"),
+                        "ctx_limit": res.get("ctx_limit"),
+                        "tier_history": res.get("tier_history"),
+                        "tier_best_score": res.get("tier_best_score"),
                         "pending_final": bool(res.get("pending_final")),
                     }))
                     try:

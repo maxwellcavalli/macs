@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, asyncio, json, time
-from typing import Optional, AsyncIterator, Dict, Any, Set
+from typing import Optional, AsyncIterator, Dict, Any, Set, Tuple
 import httpx
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -93,8 +93,9 @@ async def generate_stream(
     prompt: str,
     *,
     num_ctx: Optional[int] = None,
+    num_predict: Optional[int] = None,
     temperature: Optional[float] = 0.2,
-) -> AsyncIterator[Dict[str, Any]]:
+) -> AsyncIterator[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
     """
     Yields chunks from /api/generate stream:
       {"response": "<text>", "done": false}
@@ -111,6 +112,8 @@ async def generate_stream(
     }
     if num_ctx:
         payload["options"]["num_ctx"] = int(num_ctx)
+    if num_predict:
+        payload["options"]["num_predict"] = int(num_predict)
     if temperature is not None:
         payload["options"]["temperature"] = float(temperature)
 
@@ -118,15 +121,22 @@ async def generate_stream(
         try:
             async with cx.stream("POST", url, json=payload) as r:
                 r.raise_for_status()
+                final: Optional[Dict[str, Any]] = None
                 async for line in r.aiter_lines():
                     if not line:
                         continue
                     try:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
-                        # sometimes blank/partial lines slip; skip quietly
                         continue
-                    yield obj
+                    if obj.get("done"):
+                        final = obj
+                        yield obj, final
+                        final = None
+                    else:
+                        yield obj, final
+                if final:
+                    yield {}, final
         except httpx.HTTPStatusError as exc:
             detail = ""
             try:

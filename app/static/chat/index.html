@@ -81,6 +81,7 @@
               <div class="border-t border-slate-800 bg-slate-900/80 px-4 py-3 flex flex-wrap items-center gap-3">
                 <button type="button" id="memoryRefreshBtn" class="rounded-2xl border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 transition">Find related work</button>
                 <span id="memoryStatus" class="text-[0.75rem] text-slate-400 hidden"></span>
+                <span id="contextUsageGlobal" class="text-[0.75rem] text-slate-400 hidden"></span>
               </div>
               <form id="composer" class="border-t border-slate-800 bg-slate-900/80 px-4 py-4 flex gap-3 items-end">
                 <textarea id="messageInput" class="flex-1 min-h-[72px] max-h-52 resize-y rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm text-slate-100 focus:outline-none focus:ring focus:ring-indigo-500/40" placeholder="Type your message..."></textarea>
@@ -143,13 +144,14 @@
       manualSelection: false,
     };
 
-    const messagesEl = document.getElementById("messages");
-    const inputEl = document.getElementById("messageInput");
-    const sendBtn = document.getElementById("sendBtn");
-    const apiBaseEl = document.getElementById("apiBase");
-    const apiKeyEl = document.getElementById("apiKey");
-    const newChatBtn = document.getElementById("newChatBtn");
-    const composerForm = document.getElementById("composer");
+  const messagesEl = document.getElementById("messages");
+  const inputEl = document.getElementById("messageInput");
+  const sendBtn = document.getElementById("sendBtn");
+  const apiBaseEl = document.getElementById("apiBase");
+  const apiKeyEl = document.getElementById("apiKey");
+  const newChatBtn = document.getElementById("newChatBtn");
+  const composerForm = document.getElementById("composer");
+  const contextUsageGlobalEl = document.getElementById("contextUsageGlobal");
 
     const conversation = [];
 
@@ -180,10 +182,14 @@
       ghost.textContent = "Conversation cleared.";
       messagesEl.appendChild(ghost);
       memoryState.selected.clear();
-      memoryState.results = [];
-      memoryState.manualSelection = false;
-      updateMemoryPanel();
+    memoryState.results = [];
+    memoryState.manualSelection = false;
+    updateMemoryPanel();
+    if (contextUsageGlobalEl) {
+      contextUsageGlobalEl.classList.add("hidden");
+      contextUsageGlobalEl.textContent = "";
     }
+  }
 
     function scrollMessages() {
       messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -503,11 +509,70 @@
     function renderMarkdown(target, text) {
       const html = marked.parse(text || "");
       target.innerHTML = html;
-      decorateCodeBlocks(target);
-      target.querySelectorAll("pre code").forEach(code => {
-        hljs.highlightElement(code);
-      });
+    decorateCodeBlocks(target);
+    target.querySelectorAll("pre code").forEach(code => {
+      hljs.highlightElement(code);
+    });
+  }
+
+  function setGlobalContextUsage(promptTokens, completionTokens, ctxLimit) {
+    if (!contextUsageGlobalEl) return;
+    const hasPrompt = typeof promptTokens === "number" && promptTokens > 0;
+    const hasCompletion = typeof completionTokens === "number" && completionTokens > 0;
+    const total = (promptTokens || 0) + (completionTokens || 0);
+    if (!hasPrompt && !hasCompletion && total === 0) {
+      contextUsageGlobalEl.classList.add("hidden");
+      contextUsageGlobalEl.textContent = "";
+      return;
     }
+    const parts = [];
+    if (promptTokens != null) parts.push(`prompt ${promptTokens}`);
+    if (completionTokens != null) parts.push(`completion ${completionTokens}`);
+    let summary = parts.join(" • ");
+    if (ctxLimit) {
+      const pct = Math.min(100, Math.round((total / ctxLimit) * 100));
+      summary += ` — ${pct}% of ${ctxLimit}`;
+    }
+    contextUsageGlobalEl.textContent = summary;
+    contextUsageGlobalEl.classList.remove("hidden");
+  }
+
+  function renderContextUsage(container, payload) {
+    if (!payload) return;
+    const promptTokens = typeof payload.prompt_tokens === "number" ? payload.prompt_tokens : null;
+    const completionTokens = typeof payload.completion_tokens === "number" ? payload.completion_tokens : null;
+    const ctxLimit = typeof payload.ctx_limit === "number" ? payload.ctx_limit : null;
+    if (promptTokens === null && completionTokens === null) return;
+      const existing = container.querySelector(".context-usage");
+      if (existing) {
+        existing.remove();
+      }
+      const usage = document.createElement("div");
+      usage.className = "context-usage mt-4 text-xs text-slate-400 flex flex-col gap-2";
+      const line = document.createElement("div");
+      const promptPart = `prompt ${promptTokens ?? 0}`;
+      const completionPart = `completion ${completionTokens ?? 0}`;
+      let summary = `Context: ${promptPart} • ${completionPart}`;
+      let percent = null;
+      if (ctxLimit && ctxLimit > 0) {
+        const total = (promptTokens ?? 0) + (completionTokens ?? 0);
+        percent = Math.min(100, Math.round((total / ctxLimit) * 100));
+        summary += ` (limit ${ctxLimit})`;
+      }
+      line.textContent = summary;
+      usage.appendChild(line);
+      if (percent !== null) {
+        const bar = document.createElement("div");
+        bar.className = "h-1.5 rounded-full bg-slate-800/80 overflow-hidden";
+        const fill = document.createElement("div");
+        fill.className = "h-full bg-indigo-500/80";
+        fill.style.width = `${percent}%`;
+        bar.appendChild(fill);
+      usage.appendChild(bar);
+    }
+    container.appendChild(usage);
+    setGlobalContextUsage(promptTokens, completionTokens, ctxLimit);
+  }
 
     function renderMessage(role, text, opts) {
       const options = opts || {};
@@ -589,6 +654,7 @@
         const text = data.result || data.content || data.note || JSON.stringify(data, null, 2);
         renderMarkdown(pendingBubble.body, text);
         conversation.push({ role: "assistant", content: text });
+        renderContextUsage(pendingBubble.body, data);
         if (Array.isArray(data.follow_up_steps) && data.follow_up_steps.length) {
           const follow = document.createElement("div");
           follow.className = "mt-4 rounded-2xl border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-200";
@@ -658,6 +724,7 @@
 
         renderMarkdown(pendingBubble.body, text);
         conversation.push({ role: "assistant", content: text });
+        renderContextUsage(pendingBubble.body, payload);
         pendingBubble.container.classList.remove("processing");
         if (pendingBubble.status) {
           pendingBubble.status.classList.remove("shimmer-text");

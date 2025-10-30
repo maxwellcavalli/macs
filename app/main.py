@@ -444,6 +444,19 @@ try:
 except Exception as _e:
     print("[startup] artifact_api not enabled:", _e)
 
+# --- expose mode_hint helper
+@app.get("/v1/debug/mode_hint")
+async def debug_mode_hint(task_id: str):
+    try:
+        from .artifact_api import _read_result_json  # type: ignore
+    except Exception:
+        return {"error": "artifact reader unavailable"}
+    data = _read_result_json(task_id)
+    if not data:
+        return {"error": "no artifact"}
+    meta = data.get("metadata") or {}
+    return {"mode_hint": meta.get("mode_hint"), "mode": data.get("mode")}
+
 # --- attach a minimal asyncpg task_repo from env (if none present) ---
 try:
     if not getattr(app.state, "task_repo", None):

@@ -54,7 +54,11 @@ def _row_to_payload(row: Any, task_id: str) -> dict[str, Any]:
         except Exception: d = {k: getattr(row, k) for k in dir(row) if not k.startswith("_")}
     d["id"] = d.get("id", task_id)
     d["status"] = _normalize_status(d.get("status")) or "queued"
-    keep = {"id","status","model_used","latency_ms","template_ver","result","output","message","content","note"}
+    keep = {
+        "id","status","model_used","latency_ms","template_ver",
+        "result","output","message","content","note",
+        "zip_url","follow_up_steps","prompt_tokens","completion_tokens","ctx_limit",
+    }
     return {k:v for k,v in d.items() if k in keep}
 
 async def _synthesize_payload(task_id: str, request: Request) -> Optional[dict[str, Any]]:
@@ -73,6 +77,12 @@ async def _synthesize_payload(task_id: str, request: Request) -> Optional[dict[s
                         payload["zip_url"] = extra.get("zip_url")
                     if extra.get("follow_up_steps"):
                         payload["follow_up_steps"] = extra.get("follow_up_steps")
+                    if extra.get("prompt_tokens") is not None:
+                        payload["prompt_tokens"] = extra.get("prompt_tokens")
+                    if extra.get("completion_tokens") is not None:
+                        payload["completion_tokens"] = extra.get("completion_tokens")
+                    if extra.get("ctx_limit") is not None:
+                        payload["ctx_limit"] = extra.get("ctx_limit")
                 return payload
     except Exception:
         pass
@@ -88,6 +98,12 @@ async def _synthesize_payload(task_id: str, request: Request) -> Optional[dict[s
             payload["result"] = extra["content"]
         if extra.get("follow_up_steps"):
             payload["follow_up_steps"] = extra.get("follow_up_steps")
+        if extra.get("prompt_tokens") is not None:
+            payload["prompt_tokens"] = extra.get("prompt_tokens")
+        if extra.get("completion_tokens") is not None:
+            payload["completion_tokens"] = extra.get("completion_tokens")
+        if extra.get("ctx_limit") is not None:
+            payload["ctx_limit"] = extra.get("ctx_limit")
         return payload
     return None
 
