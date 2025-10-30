@@ -2,6 +2,9 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 PY ?= python3
+ifneq ($(wildcard .venv/bin/python3),)
+PY := .venv/bin/python3
+endif
 
 .DEFAULT_GOAL := help
 
@@ -68,3 +71,19 @@ memory-ingest: ## Bootstrap existing repo files into workspace memory
 .PHONY: factory-validate
 factory-validate: ## 413 check via factory-wrapped ASGI limiter
 > API_URL="$(API_URL)" MACS_MAX_BODY_BYTES="$(MACS_MAX_BODY_BYTES)" bash scripts/validate_factory_and_limit.sh
+
+# --- CLI -----------------------------------------------------
+.PHONY: cli-build cli-clean cli-run
+CLI_SPEC ?= agentctl.spec
+CLI_BINARY ?= dist/agentctl
+CLI_HIDDEN ?= --hidden-import httpx --hidden-import httpcore --hidden-import anyio --hidden-import certifi --hidden-import idna
+
+cli-build: ## Build standalone agentctl binary using PyInstaller
+> $(PY) -m PyInstaller --onefile cli/agentctl.py --name agentctl $(CLI_HIDDEN)
+> @echo "CLI built at $(CLI_BINARY)"
+
+cli-clean: ## Remove PyInstaller build artifacts
+> rm -rf build dist $(CLI_SPEC) __pycache__ cli/__pycache__
+
+cli-run: ## Execute agentctl via python
+> $(PY) -m cli.agentctl $(ARGS)

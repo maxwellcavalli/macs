@@ -7,3 +7,7 @@ ollama/*
 /workspace/
 /ollama/
 /artifacts/
+bandit-*.csv
+bandit-*.jsonl
+/build/
+/dist/

@@ -150,4 +150,20 @@ API_HOST_PORT=18080 PG_HOST_PORT=56432 PROM_HOST_PORT=49090 GRAFANA_HOST_PORT=43
 
 ---
 
+## 9) Agent CLI
+
+Install the package locally (`pip install -e .`) to expose the `agentctl` command.
+
+- Chat once: `agentctl chat "hello" --language python --download`  
+  This streams the task, prints the answer, and saves the zip to `workspace/zips/`.
+- Attach context: `agentctl chat "review the repo" --attach uploads.zip` uploads the archive via `/v1/memory/upload` before creating the task.
+- Generate code: `agentctl code "Create HelloController" --language java --expected-file src/main/java/...` waits for completion and prints follow-up steps.
+- Stay in a session: `agentctl chat-session --attach repo.zip` opens an interactive REPL (prompts list commands like `/attach`, `/download`, `/exit`).
+- Inspect tasks: `agentctl status <task-id>` and `agentctl download --id <task-id>` retrieve status and artifacts.
+- Raw payloads still work: `agentctl submit task.json` and `agentctl feedback feedback.json`.
+
+Set `API_URL` / `API_KEY` env vars (or pass `--api-url`, `--api-key`) so the CLI can authenticate against your running API.
+
+---
+
 Happy shipping! 🚀
