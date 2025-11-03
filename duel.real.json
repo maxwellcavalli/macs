@@ -1,0 +1,17 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": ["spring-boot"],
+    "repo": { "path": "./workspace", "include": [], "exclude": [] },
+    "constraints": { "max_tokens": 1024, "latency_ms": 60000 },
+    "goal": "Implement a minimal REST controller that returns `ok` at GET /health."
+  },
+  "routing_hints": {
+    "duel": true,
+    "duel_candidates": ["mistral:7b-instruct-q4_K_M", "qwen2.5-coder:7b-instruct-q4_K_M"]
+  },
+  "output_contract": {
+    "expected_files": ["src/main/java/com/acme/DemoController.java"]
+  }
+}

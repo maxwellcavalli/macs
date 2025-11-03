@@ -1,0 +1,11 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": ["spring-boot"],
+    "repo": { "path": "./workspace", "include": ["src/**"], "exclude": [] },
+    "constraints": { "max_tokens": 4096, "latency_ms": 60000 },
+    "goal": "Create a simple controller that returns 'ok'."
+  },
+  "output_contract": { "expected_files": ["src/main/java/com/acme/Demo.java"] }
+}

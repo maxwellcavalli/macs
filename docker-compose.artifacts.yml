@@ -1,0 +1,8 @@
+services:
+  api:
+    environment:
+      ARTIFACTS_DIR: /data/artifacts
+    volumes:
+      - artifacts:/data/artifacts
+volumes:
+  artifacts:

@@ -1,0 +1,4 @@
+services:
+  api:
+    environment:
+      STATUS_GUARD_MODE: "error"   # use "fix" to auto-rewrite while hunting source

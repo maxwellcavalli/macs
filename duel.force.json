@@ -1,0 +1,15 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": [],
+    "repo": { "path": "./workspace", "include": [], "exclude": [] },
+    "constraints": { "max_tokens": 512, "latency_ms": 30000 },
+    "goal": "Hello world service."
+  },
+  "routing_hints": {
+    "duel": true,
+    "duel_candidates": ["mistral:7b-instruct-q4_K_M", "qwen2.5-coder:7b-instruct-q4_K_M"]
+  },
+  "output_contract": { "expected_files": ["src/main/java/com/acme/Hello.java"] }
+}

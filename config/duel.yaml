@@ -1,0 +1,9 @@
+# Winner rule config
+rule_version: "v1"
+success_weight: 1.4         # stronger reward for functional completion
+test_pass_weight: 0.9       # emphasize passing compile/test checks
+latency_penalty_ms: 0.001   # lower latency penalty so quality wins
+human_score_weight: 0.1     # bonus per human score point (0..5)
+duel_candidates:
+  - qwen2.5-coder:7b-instruct-q4_K_M
+  - llama3.1:8b-instruct-q4_K_M

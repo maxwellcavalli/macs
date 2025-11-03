@@ -1,0 +1,12 @@
+{
+  "type": "CODE",
+  "input": {
+    "language": "java",
+    "frameworks": [],
+    "repo": { "path": "./workspace", "include": [], "exclude": [] },
+    "constraints": { "max_tokens": 2048, "latency_ms": 60000 },
+    "goal": "Generate a single-file minimal Java class using only JDK; no markdown or prose."
+  },
+  "routing_hints": { "duel": true },
+  "output_contract": { "expected_files": ["src/main/java/com/acme/Demo.java"] }
+}

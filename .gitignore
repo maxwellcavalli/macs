@@ -1,0 +1,14 @@
+*.bak*
+docker-compose.override.yml
+artifacts/*
+workspace/*
+workspace/zips/
+ollama/*
+/workspace/
+/ollama/
+/artifacts/
+bandit-*.csv
+bandit-*.jsonl
+/build/
+/dist/
+/workspace/.duel/
